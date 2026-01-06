@@ -1,3 +1,7 @@
+#ifndef ResetTalents
+#define ResetTalents ResetTalents_NOT_AVAILABLE_IN_THIS_CORE
+#endif
+
 #include "Config.h"
 #include "Define.h"
 #include "GossipDef.h"
@@ -6,6 +10,16 @@
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
 #include "Spell.h"
+#include "Chat.h"
+#include "PlayerSettings.h"
+#include "InstanceSaveMgr.h"
+
+// Individual Progression (phases/expansions)
+#include "IndividualProgression.h"
+
+// Echo Coins storage is account-based (acore_auth.account.donationpoints)
+#include "DatabaseEnv.h"
+#include "LoginDatabase.h"
 
 enum Vendors
 {
@@ -58,19 +72,644 @@ enum Mounts
 
 enum PremiumGossip
 {
-    PREMIUM_MENU = 62001,
     PREMIUM_MENU_TEXT = 90003,
-    GOSSIP_MORPH = 0,
-    GOSSIP_DEMORPH,
-    GOSSIP_MOUNT,
-    GOSSIP_TRAIN_ME,
-    GOSSIP_PLAYER,
-    GOSSIP_VENDOR,
-    GOSSIP_MAIL,
-    GOSSIP_BANK,
-    GOSSIP_AUCTION_HOUSE,
-    GOSSIP_FACTION
 };
+
+enum PremiumPage : uint32
+{
+    PAGE_MAIN = 1,
+    PAGE_APPEARANCE,
+    PAGE_SERVICES,
+    PAGE_TRAVEL,
+    PAGE_CHARACTER,
+    PAGE_MOUNT,
+    PAGE_PROGRESSION
+};
+
+enum PremiumAction : uint32
+{
+    ACTION_OPEN_APPEARANCE = GOSSIP_ACTION_INFO_DEF + 10,
+    ACTION_OPEN_SERVICES = GOSSIP_ACTION_INFO_DEF + 11,
+    ACTION_OPEN_TRAVEL = GOSSIP_ACTION_INFO_DEF + 12,
+    ACTION_OPEN_CHARACTER = GOSSIP_ACTION_INFO_DEF + 13,
+    ACTION_OPEN_MOUNT = GOSSIP_ACTION_INFO_DEF + 14,
+
+    ACTION_OPEN_PROGRESSION = GOSSIP_ACTION_INFO_DEF + 15,
+
+    ACTION_BACK_TO_MAIN = GOSSIP_ACTION_INFO_DEF + 20,
+    ACTION_CLOSE = GOSSIP_ACTION_INFO_DEF + 21,
+
+    // Appearance
+    ACTION_MORPH = GOSSIP_ACTION_INFO_DEF + 30,
+    ACTION_DEMORPH = GOSSIP_ACTION_INFO_DEF + 31,
+    ACTION_MOUNT = GOSSIP_ACTION_INFO_DEF + 32,
+
+    // Character
+    ACTION_RESET_ALL_INSTANCES = GOSSIP_ACTION_INFO_DEF + 33,
+    ACTION_BUY_EC_1 = GOSSIP_ACTION_INFO_DEF + 34,
+
+    // Individual Progression
+    ACTION_IP_SKIP_PHASE = GOSSIP_ACTION_INFO_DEF + 35,
+    ACTION_IP_SKIP_EXPANSION = GOSSIP_ACTION_INFO_DEF + 36,
+
+    // Services
+    ACTION_VENDOR = GOSSIP_ACTION_INFO_DEF + 40,
+    ACTION_MAILBOX = GOSSIP_ACTION_INFO_DEF + 41,
+    ACTION_BANK = GOSSIP_ACTION_INFO_DEF + 42,
+    ACTION_AUCTION = GOSSIP_ACTION_INFO_DEF + 43,
+    ACTION_TRAINER = GOSSIP_ACTION_INFO_DEF + 44,
+
+    // Travel (teleports)
+    ACTION_TP_STORMWIND = GOSSIP_ACTION_INFO_DEF + 60,
+    ACTION_TP_IRONFORGE = GOSSIP_ACTION_INFO_DEF + 61,
+    ACTION_TP_DARNASSUS = GOSSIP_ACTION_INFO_DEF + 62,
+    ACTION_TP_EXODAR = GOSSIP_ACTION_INFO_DEF + 63,
+
+    ACTION_TP_ORGRIMMAR = GOSSIP_ACTION_INFO_DEF + 70,
+    ACTION_TP_UNDERCITY = GOSSIP_ACTION_INFO_DEF + 71,
+    ACTION_TP_THUNDERBLUFF = GOSSIP_ACTION_INFO_DEF + 72,
+    ACTION_TP_SILVERMOON = GOSSIP_ACTION_INFO_DEF + 73,
+};
+
+struct TpLocation
+{
+    uint32 map;
+    float x;
+    float y;
+    float z;
+    float o;
+};
+
+namespace
+{
+    static std::string const PremiumPSSource = "mod-premium";
+
+    enum PremiumSettingIndexes : uint8
+    {
+        SETTING_ACTIVITY_POINTS = 0,
+        SETTING_ACTIVITY_SECONDS = 1,
+        SETTING_ACTIVITY_MILLISECONDS = 2,
+        MAX_PREMIUM_SETTINGS = 3
+    };
+
+    uint32 GetAP(Player* player);
+    void SetAP(Player* player, uint32 ap);
+    uint32 GetAccumSeconds(Player* player);
+    void SetAccumSeconds(Player* player, uint32 secs);
+    uint32 GetAccumMilliseconds(Player* player);
+    void SetAccumMilliseconds(Player* player, uint32 ms);
+
+    uint64 GetExchangeRateGoldPerEC()
+    {
+        return sConfigMgr->GetOption<uint32>("Premium.EC.GoldPerEC", 5000000); // 500g in copper
+    }
+
+    std::string FormatMoneyCopper(uint64 copper)
+    {
+        uint64 gold = copper / GOLD;
+        uint64 silver = (copper % GOLD) / SILVER;
+        uint64 copperRest = copper % SILVER;
+        return std::to_string(gold) + "g " + std::to_string(silver) + "s " + std::to_string(copperRest) + "c";
+    }
+
+    bool TryBuyECWithGold(Player* player, uint32 ecAmount)
+    {
+        if (!player || ecAmount == 0)
+            return false;
+
+        if (!sConfigMgr->GetOption<bool>("Premium.EC.Exchange.Enabled", true))
+            return false;
+
+        uint64 cost = GetExchangeRateGoldPerEC() * uint64(ecAmount);
+        if (cost == 0)
+            return false;
+
+        if (player->GetMoney() < cost)
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage("Not enough gold. Need {} for {} EC.", FormatMoneyCopper(cost), ecAmount);
+            return false;
+        }
+
+        player->ModifyMoney(-int64(cost));
+        uint32 ec = GetAP(player);
+        SetAP(player, ec + ecAmount);
+        ChatHandler(player->GetSession()).PSendSysMessage("You purchased {} EC for {}. Total: {} EC.", ecAmount, FormatMoneyCopper(cost), ec + ecAmount);
+        return true;
+    }
+
+    uint32 GetAP(Player* player)
+    {
+        if (!player || !player->GetSession())
+            return 0;
+
+        if (!sConfigMgr->GetOption<bool>("Premium.EC.UseAuthDonationPoints", true))
+            return player->GetPlayerSetting(PremiumPSSource, SETTING_ACTIVITY_POINTS).value;
+
+        QueryResult res = LoginDatabase.Query("SELECT donationpoints FROM account WHERE id = {}", player->GetSession()->GetAccountId());
+        if (!res)
+            return 0;
+
+        Field* f = res->Fetch();
+        return f[0].Get<uint32>();
+    }
+
+    void SetAP(Player* player, uint32 ap)
+    {
+        if (!player || !player->GetSession())
+            return;
+
+        if (!sConfigMgr->GetOption<bool>("Premium.EC.UseAuthDonationPoints", true))
+        {
+            player->UpdatePlayerSetting(PremiumPSSource, SETTING_ACTIVITY_POINTS, ap);
+            return;
+        }
+
+        LoginDatabase.Execute("UPDATE account SET donationpoints = {} WHERE id = {}", ap, player->GetSession()->GetAccountId());
+    }
+
+    uint32 GetAccumSeconds(Player* player)
+    {
+        return player->GetPlayerSetting(PremiumPSSource, SETTING_ACTIVITY_SECONDS).value;
+    }
+
+    void SetAccumSeconds(Player* player, uint32 secs)
+    {
+        player->UpdatePlayerSetting(PremiumPSSource, SETTING_ACTIVITY_SECONDS, secs);
+    }
+
+    uint32 GetAccumMilliseconds(Player* player)
+    {
+        return player->GetPlayerSetting(PremiumPSSource, SETTING_ACTIVITY_MILLISECONDS).value;
+    }
+
+    void SetAccumMilliseconds(Player* player, uint32 ms)
+    {
+        player->UpdatePlayerSetting(PremiumPSSource, SETTING_ACTIVITY_MILLISECONDS, ms);
+    }
+
+    bool IsPremium(Player* player)
+    {
+        if (!player)
+            return false;
+
+        if (!sConfigMgr->GetOption<bool>("PremiumAccount", true))
+            return false;
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT `AccountId` FROM `premium` WHERE `active`=1 AND `AccountId`={}",
+            player->GetSession()->GetAccountId());
+
+        return result != nullptr;
+    }
+
+    uint32 GetActionCostAP(uint32 action)
+    {
+        // default costs (can be overridden by config via per-feature toggles below)
+        switch (action)
+        {
+            case ACTION_MORPH: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Morph", 5);
+            case ACTION_DEMORPH: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Demorph", 0);
+            case ACTION_MOUNT: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Mount", 2);
+            case ACTION_RESET_ALL_INSTANCES: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.ResetAllInstances", 10);
+
+            case ACTION_IP_SKIP_PHASE: return 5;
+            case ACTION_IP_SKIP_EXPANSION: return 15;
+
+            case ACTION_VENDOR: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Vendor", 3);
+            case ACTION_AUCTION: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Auction", 3);
+            case ACTION_TRAINER: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Trainer", 3);
+            case ACTION_MAILBOX: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Mailbox", 1);
+            case ACTION_BANK: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Bank", 1);
+            case ACTION_TP_STORMWIND:
+            case ACTION_TP_IRONFORGE:
+            case ACTION_TP_DARNASSUS:
+            case ACTION_TP_EXODAR:
+            case ACTION_TP_ORGRIMMAR:
+            case ACTION_TP_UNDERCITY:
+            case ACTION_TP_THUNDERBLUFF:
+            case ACTION_TP_SILVERMOON:
+                return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Teleport", 2);
+            default:
+                return 0;
+        }
+    }
+
+    static char const* GetProgressionName(uint8 state)
+    {
+        switch (state)
+        {
+            case PROGRESSION_START: return "T0-1: Molten Core & Onyxia";
+            case PROGRESSION_MOLTEN_CORE: return "T2: Blackwing Lair";
+            case PROGRESSION_ONYXIA: return "T2: Blackwing Lair";
+            case PROGRESSION_BLACKWING_LAIR: return "T3: Pre-AQ";
+            case PROGRESSION_PRE_AQ: return "T4: AQ War";
+            case PROGRESSION_AQ_WAR: return "T5: Ahn'Qiraj";
+            case PROGRESSION_AQ: return "T6: Naxxramas";
+            case PROGRESSION_NAXX40: return "T7: Pre-TBC";
+            case PROGRESSION_PRE_TBC: return "T8: Karazhan, Gruul & Magtheridon";
+            case PROGRESSION_TBC_TIER_1: return "T9: SSC & Tempest Keep";
+            case PROGRESSION_TBC_TIER_2: return "T10: Hyjal & Black Temple";
+            case PROGRESSION_TBC_TIER_3: return "T11: Zul'Aman";
+            case PROGRESSION_TBC_TIER_4: return "T12: Sunwell Plateau";
+            case PROGRESSION_TBC_TIER_5: return "T13: Naxx, EoE & OS";
+            case PROGRESSION_WOTLK_TIER_1: return "T14: Ulduar";
+            case PROGRESSION_WOTLK_TIER_2: return "T15: Trial of the Crusader";
+            case PROGRESSION_WOTLK_TIER_3: return "T16: Icecrown Citadel";
+            case PROGRESSION_WOTLK_TIER_4: return "T17: Ruby Sanctum";
+            case PROGRESSION_WOTLK_TIER_5: return "T17: Ruby Sanctum";
+            default: return "Unknown";
+        }
+    }
+
+    static uint8 GetIPStateSafe(Player* player)
+    {
+        if (!player)
+            return 0;
+
+        return player->GetPlayerSetting("mod-individual-progression", SETTING_PROGRESSION_STATE).value;
+    }
+
+    static std::string GetSkipPhaseLabel(Player* player)
+    {
+        uint8 current = GetIPStateSafe(player);
+        uint8 next = current < PROGRESSION_WOTLK_TIER_5 ? uint8(current + 1) : current;
+
+        if (current >= PROGRESSION_WOTLK_TIER_5)
+            return "Skip phase (already at maximum)";
+
+        return "Skip " + std::string(GetProgressionName(current)) + ", unlock " + std::string(GetProgressionName(next));
+    }
+
+    static std::string GetSkipExpansionLabel(Player* player)
+    {
+        uint8 current = GetIPStateSafe(player);
+
+        if (current < PROGRESSION_PRE_TBC)
+            return "Skip Vanilla content, unlock TBC";
+
+        if (current < PROGRESSION_TBC_TIER_5)
+            return "Skip TBC content, unlock WotLK";
+
+        return "";
+    }
+
+    bool TrySpendAPForAction(Player* player, uint32 action)
+    {
+        if (!player)
+            return false;
+
+        // Progression skips always cost EC, even for Premium accounts.
+        if (IsPremium(player) && action != ACTION_IP_SKIP_PHASE && action != ACTION_IP_SKIP_EXPANSION)
+            return true;
+
+        if (!sConfigMgr->GetOption<bool>("Premium.AP.Enabled", true))
+            return false;
+
+        uint32 cost = GetActionCostAP(action);
+        if (cost == 0)
+            return true;
+
+        uint32 ap = GetAP(player);
+        if (ap < cost)
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage("Not enough Echo Coins (EC). You have {} EC, need {} EC.", ap, cost);
+            return false;
+        }
+
+        SetAP(player, ap - cost);
+        ChatHandler(player->GetSession()).PSendSysMessage("Spent {} EC. Remaining: {} EC.", cost, ap - cost);
+        return true;
+    }
+
+    bool TrySpendAPForActionAny(Player* player, uint32 action)
+    {
+        if (!player)
+            return false;
+
+        if (!sConfigMgr->GetOption<bool>("Premium.AP.Enabled", true))
+            return false;
+
+        uint32 cost = GetActionCostAP(action);
+        if (cost == 0)
+            return true;
+
+        uint32 ap = GetAP(player);
+        if (ap < cost)
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage("Not enough Echo Coins (EC). You have {} EC, need {} EC.", ap, cost);
+            return false;
+        }
+
+        SetAP(player, ap - cost);
+        ChatHandler(player->GetSession()).PSendSysMessage("Spent {} EC. Remaining: {} EC.", cost, ap - cost);
+        return true;
+    }
+
+    std::string LabelWithCost(Player* player, std::string const& label, uint32 action)
+    {
+        if (IsPremium(player))
+            return label + " (Premium)";
+
+        if (!sConfigMgr->GetOption<bool>("Premium.AP.Enabled", true))
+            return label;
+
+        uint32 cost = GetActionCostAP(action);
+        if (cost == 0)
+            return label;
+
+        return label + " [" + std::to_string(cost) + " EC]";
+    }
+
+    std::string LabelWithCostAny(Player* player, std::string const& label, uint32 action)
+    {
+        if (!sConfigMgr->GetOption<bool>("Premium.AP.Enabled", true))
+            return label;
+
+        uint32 cost = GetActionCostAP(action);
+        if (cost == 0)
+            return label;
+
+        return label + " [" + std::to_string(cost) + " EC]";
+    }
+
+    uint8 GetIPState(Player* player)
+    {
+        if (!player)
+            return 0;
+
+        return player->GetPlayerSetting("mod-individual-progression", SETTING_PROGRESSION_STATE).value;
+    }
+
+    bool TrySkipIPPhase(Player* player)
+    {
+        if (!player || !player->IsInWorld())
+            return false;
+
+        if (!sIndividualProgression->enabled)
+        {
+            ChatHandler(player->GetSession()).SendSysMessage("Individual Progression is disabled.");
+            return false;
+        }
+
+        if (sIndividualProgression->isExcludedFromProgression(player))
+        {
+            ChatHandler(player->GetSession()).SendSysMessage("This account is excluded from Individual Progression.");
+            return false;
+        }
+
+        uint8 currentState = GetIPState(player);
+        if (currentState >= PROGRESSION_WOTLK_TIER_5)
+        {
+            ChatHandler(player->GetSession()).SendSysMessage("You are already at the maximum progression phase.");
+            return false;
+        }
+
+        uint8 nextState = currentState + 1;
+        if (sIndividualProgression->progressionLimit && nextState > sIndividualProgression->progressionLimit)
+        {
+            ChatHandler(player->GetSession()).SendSysMessage("Cannot skip: progression limit reached.");
+            return false;
+        }
+
+        uint32 currentArea = player->GetAreaId();
+        sIndividualProgression->ForceUpdateProgressionState(player, static_cast<ProgressionState>(nextState));
+        sIndividualProgression->UpdateProgressionQuests(player);
+        sIndividualProgression->checkIPPhasing(player, currentArea);
+        sIndividualProgression->CheckAdjustments(player);
+
+        ChatHandler(player->GetSession()).PSendSysMessage("Progression advanced by 1 phase. New phase: {}.", nextState);
+        return true;
+    }
+
+    bool TrySkipIPExpansion(Player* player)
+    {
+        if (!player || !player->IsInWorld())
+            return false;
+
+        if (!sIndividualProgression->enabled)
+        {
+            ChatHandler(player->GetSession()).SendSysMessage("Individual Progression is disabled.");
+            return false;
+        }
+
+        if (sIndividualProgression->isExcludedFromProgression(player))
+        {
+            ChatHandler(player->GetSession()).SendSysMessage("This account is excluded from Individual Progression.");
+            return false;
+        }
+
+        uint8 currentState = GetIPState(player);
+        uint8 targetState = currentState;
+
+        // Vanilla -> start of TBC progression bucket
+        if (currentState < PROGRESSION_PRE_TBC)
+            targetState = PROGRESSION_PRE_TBC;
+        // TBC -> start of WotLK progression bucket
+        else if (currentState < PROGRESSION_TBC_TIER_5)
+            targetState = PROGRESSION_TBC_TIER_5;
+        else
+        {
+            ChatHandler(player->GetSession()).SendSysMessage("You are already in the last expansion bucket.");
+            return false;
+        }
+
+        if (targetState == currentState)
+        {
+            ChatHandler(player->GetSession()).SendSysMessage("No expansion skip available from your current phase.");
+            return false;
+        }
+
+        if (sIndividualProgression->progressionLimit && targetState > sIndividualProgression->progressionLimit)
+        {
+            ChatHandler(player->GetSession()).SendSysMessage("Cannot skip: progression limit reached.");
+            return false;
+        }
+
+        uint32 currentArea = player->GetAreaId();
+        sIndividualProgression->ForceUpdateProgressionState(player, static_cast<ProgressionState>(targetState));
+        sIndividualProgression->UpdateProgressionQuests(player);
+        sIndividualProgression->checkIPPhasing(player, currentArea);
+        sIndividualProgression->CheckAdjustments(player);
+
+        ChatHandler(player->GetSession()).PSendSysMessage("Progression advanced to expansion milestone. New phase: {}.", targetState);
+        return true;
+    }
+}
+
+static bool PremiumCanUse(Player* player)
+{
+    if (!player)
+        return false;
+
+    if (player->IsInCombat())
+        return false;
+
+    if (player->IsInFlight())
+        return false;
+
+    return true;
+}
+
+static bool TeleportPlayer(Player* player, TpLocation const& loc)
+{
+    if (!player)
+        return false;
+
+    if (!PremiumCanUse(player))
+        return false;
+
+    CloseGossipMenuFor(player);
+    return player->TeleportTo(loc.map, loc.x, loc.y, loc.z, loc.o);
+}
+
+static void AddNavBack(Player* player)
+{
+    AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Back", GOSSIP_SENDER_MAIN, ACTION_BACK_TO_MAIN);
+}
+
+static void AddNavClose(Player* player)
+{
+    AddGossipItemFor(player, GOSSIP_ICON_TALK, "Close", GOSSIP_SENDER_MAIN, ACTION_CLOSE);
+}
+
+static void ShowMenu(Player* player, ObjectGuid ownerGuid, uint32 page)
+{
+    ClearGossipMenuFor(player);
+
+    // Header (always visible)
+    AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+        "Echo Coins (EC): " + std::to_string(GetAP(player)) + (IsPremium(player) ? " | Premium" : ""),
+        GOSSIP_SENDER_MAIN, ACTION_BACK_TO_MAIN);
+
+    switch (page)
+    {
+        default:
+        case PAGE_MAIN:
+        {
+            if (sConfigMgr->GetOption<bool>("Morph", true))
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Appearance", GOSSIP_SENDER_MAIN, ACTION_OPEN_APPEARANCE);
+
+            AddGossipItemFor(player, GOSSIP_ICON_VENDOR, "Services", GOSSIP_SENDER_MAIN, ACTION_OPEN_SERVICES);
+            AddGossipItemFor(player, GOSSIP_ICON_TAXI, "Travel", GOSSIP_SENDER_MAIN, ACTION_OPEN_TRAVEL);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, "Character", GOSSIP_SENDER_MAIN, ACTION_OPEN_CHARACTER);
+
+            if (sIndividualProgression->enabled && !sIndividualProgression->isExcludedFromProgression(player))
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Progression", GOSSIP_SENDER_MAIN, ACTION_OPEN_PROGRESSION);
+
+            if (sConfigMgr->GetOption<bool>("Mount", true))
+                AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG, "Mount", GOSSIP_SENDER_MAIN, ACTION_OPEN_MOUNT);
+
+            AddNavClose(player);
+            break;
+        }
+
+        case PAGE_APPEARANCE:
+        {
+            if (sConfigMgr->GetOption<bool>("Morph", true))
+            {
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, LabelWithCost(player, "Random morph", ACTION_MORPH), GOSSIP_SENDER_MAIN, ACTION_MORPH);
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, LabelWithCost(player, "Demorph", ACTION_DEMORPH), GOSSIP_SENDER_MAIN, ACTION_DEMORPH);
+            }
+
+            AddNavBack(player);
+            break;
+        }
+
+        case PAGE_SERVICES:
+        {
+            if (sConfigMgr->GetOption<bool>("Trainers", true))
+                AddGossipItemFor(player, GOSSIP_ICON_TRAINER, LabelWithCost(player, "Class trainer", ACTION_TRAINER), GOSSIP_SENDER_MAIN, ACTION_TRAINER);
+
+            if (sConfigMgr->GetOption<bool>("Vendor", true))
+                AddGossipItemFor(player, GOSSIP_ICON_VENDOR, LabelWithCost(player, "Vendor", ACTION_VENDOR), GOSSIP_SENDER_MAIN, ACTION_VENDOR);
+
+            if (sConfigMgr->GetOption<bool>("MailBox", true))
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, LabelWithCost(player, "Mailbox", ACTION_MAILBOX), GOSSIP_SENDER_MAIN, ACTION_MAILBOX);
+
+            if (sConfigMgr->GetOption<bool>("Bank", true))
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, LabelWithCost(player, "Bank", ACTION_BANK), GOSSIP_SENDER_MAIN, ACTION_BANK);
+
+            if (sConfigMgr->GetOption<bool>("Auction", true))
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, LabelWithCost(player, "Auction House", ACTION_AUCTION), GOSSIP_SENDER_MAIN, ACTION_AUCTION);
+
+            AddNavBack(player);
+            break;
+        }
+
+        case PAGE_CHARACTER:
+        {
+            if (sConfigMgr->GetOption<bool>("Premium.EC.Exchange.Enabled", true))
+            {
+                uint64 rate = GetExchangeRateGoldPerEC();
+                AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG,
+                    "Buy 1 EC (" + FormatMoneyCopper(rate) + ")",
+                    GOSSIP_SENDER_MAIN, ACTION_BUY_EC_1);
+            }
+
+            if (sConfigMgr->GetOption<bool>("ResetInstances", true))
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, LabelWithCostAny(player, "Reset all dungeons/raids", ACTION_RESET_ALL_INSTANCES), GOSSIP_SENDER_MAIN, ACTION_RESET_ALL_INSTANCES);
+
+            AddNavBack(player);
+            break;
+        }
+
+        case PAGE_PROGRESSION:
+        {
+            if (!sIndividualProgression->enabled || sIndividualProgression->isExcludedFromProgression(player))
+            {
+                AddNavBack(player);
+                break;
+            }
+
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                LabelWithCostAny(player, GetSkipPhaseLabel(player), ACTION_IP_SKIP_PHASE),
+                GOSSIP_SENDER_MAIN, ACTION_IP_SKIP_PHASE);
+
+            {
+                std::string expLabel = GetSkipExpansionLabel(player);
+                if (!expLabel.empty())
+                {
+                    AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                        LabelWithCostAny(player, expLabel, ACTION_IP_SKIP_EXPANSION),
+                        GOSSIP_SENDER_MAIN, ACTION_IP_SKIP_EXPANSION);
+                }
+            }
+
+            AddNavBack(player);
+            break;
+        }
+
+        case PAGE_TRAVEL:
+        {
+            if (player->GetTeamId() == TEAM_ALLIANCE)
+            {
+                AddGossipItemFor(player, GOSSIP_ICON_TAXI, LabelWithCost(player, "Stormwind", ACTION_TP_STORMWIND), GOSSIP_SENDER_MAIN, ACTION_TP_STORMWIND);
+                AddGossipItemFor(player, GOSSIP_ICON_TAXI, LabelWithCost(player, "Ironforge", ACTION_TP_IRONFORGE), GOSSIP_SENDER_MAIN, ACTION_TP_IRONFORGE);
+                AddGossipItemFor(player, GOSSIP_ICON_TAXI, LabelWithCost(player, "Darnassus", ACTION_TP_DARNASSUS), GOSSIP_SENDER_MAIN, ACTION_TP_DARNASSUS);
+                AddGossipItemFor(player, GOSSIP_ICON_TAXI, LabelWithCost(player, "The Exodar", ACTION_TP_EXODAR), GOSSIP_SENDER_MAIN, ACTION_TP_EXODAR);
+            }
+            else
+            {
+                AddGossipItemFor(player, GOSSIP_ICON_TAXI, LabelWithCost(player, "Orgrimmar", ACTION_TP_ORGRIMMAR), GOSSIP_SENDER_MAIN, ACTION_TP_ORGRIMMAR);
+                AddGossipItemFor(player, GOSSIP_ICON_TAXI, LabelWithCost(player, "Undercity", ACTION_TP_UNDERCITY), GOSSIP_SENDER_MAIN, ACTION_TP_UNDERCITY);
+                AddGossipItemFor(player, GOSSIP_ICON_TAXI, LabelWithCost(player, "Thunder Bluff", ACTION_TP_THUNDERBLUFF), GOSSIP_SENDER_MAIN, ACTION_TP_THUNDERBLUFF);
+                AddGossipItemFor(player, GOSSIP_ICON_TAXI, LabelWithCost(player, "Silvermoon", ACTION_TP_SILVERMOON), GOSSIP_SENDER_MAIN, ACTION_TP_SILVERMOON);
+            }
+
+            AddNavBack(player);
+            break;
+        }
+
+        case PAGE_MOUNT:
+        {
+            AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG, LabelWithCost(player, "Summon racial mount", ACTION_MOUNT), GOSSIP_SENDER_MAIN, ACTION_MOUNT);
+            AddNavBack(player);
+            break;
+        }
+    }
+
+    SendGossipMenuFor(player, PREMIUM_MENU_TEXT, ownerGuid);
+}
 
 class premium_account : public ItemScript
 {
@@ -79,19 +718,15 @@ public:
 
     bool OnUse(Player* player, Item* item, SpellCastTargets const& /*targets*/) override
     {
-        if (!sConfigMgr->GetOption<bool>("PremiumAccount", true))
+        if (!player || !item)
             return false;
 
-        QueryResult result = CharacterDatabase.Query("SELECT `AccountId` FROM `premium` WHERE `active`=1 AND `AccountId`={}", player->GetSession()->GetAccountId());
-
-        if (!result)
+        // Everyone can open the menu
+        if (!PremiumCanUse(player))
             return false;
 
-        if (player->IsInCombat())
-            return false;
-
+        // Keep proximity restrictions from original
         float rangeCheck = 10.0f;
-
         if (player->FindNearestCreature(NPC_AUCTION_A, rangeCheck) ||
             player->FindNearestCreature(NPC_AUCTION_H, rangeCheck) ||
             player->FindNearestCreature(NPC_VENDOR_A, rangeCheck) ||
@@ -117,94 +752,116 @@ public:
             player->FindNearestCreature(DEATHKNIGHT_AH, rangeCheck))
             return false;
 
-        ClearGossipMenuFor(player);
-
-        if (sConfigMgr->GetOption<bool>("Morph", true))
-        {
-            AddGossipItemFor(player, PREMIUM_MENU, GOSSIP_MORPH, GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF + 1);
-            AddGossipItemFor(player, PREMIUM_MENU, GOSSIP_DEMORPH, GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF + 2);
-        }
-
-        if (sConfigMgr->GetOption<bool>("Mount", true))
-            AddGossipItemFor(player, PREMIUM_MENU, GOSSIP_MOUNT, GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF + 6);
-
-        if (sConfigMgr->GetOption<bool>("Trainers", true))
-            AddGossipItemFor(player, PREMIUM_MENU, GOSSIP_TRAIN_ME, GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF + 8);
-
-        if (sConfigMgr->GetOption<bool>("PlayerInteraction", true))
-            AddGossipItemFor(player, PREMIUM_MENU, GOSSIP_PLAYER, GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF + 9);
-
-        SendGossipMenuFor(player, PREMIUM_MENU_TEXT, item->GetGUID());
-        return false; // Cast the spell on use normally
+        ShowMenu(player, item->GetGUID(), PAGE_MAIN);
+        return true;
     }
 
     void OnGossipSelect(Player* player, Item* item, uint32 /*sender*/, uint32 action) override
     {
+        if (!player || !item)
+            return;
+
+        if (!PremiumCanUse(player))
+        {
+            CloseGossipMenuFor(player);
+            return;
+        }
+
+        // Gold -> EC exchange
+        if (action == ACTION_BUY_EC_1)
+        {
+            CloseGossipMenuFor(player);
+            TryBuyECWithGold(player, 1);
+            return;
+        }
+
+        // Navigation actions are always free
         switch (action)
         {
-            case GOSSIP_ACTION_INFO_DEF + 1: /*Morph*/
+            case ACTION_OPEN_APPEARANCE:
+                ShowMenu(player, item->GetGUID(), PAGE_APPEARANCE);
+                return;
+            case ACTION_OPEN_SERVICES:
+                ShowMenu(player, item->GetGUID(), PAGE_SERVICES);
+                return;
+            case ACTION_OPEN_TRAVEL:
+                ShowMenu(player, item->GetGUID(), PAGE_TRAVEL);
+                return;
+            case ACTION_OPEN_CHARACTER:
+                ShowMenu(player, item->GetGUID(), PAGE_CHARACTER);
+                return;
+            case ACTION_OPEN_MOUNT:
+                ShowMenu(player, item->GetGUID(), PAGE_MOUNT);
+                return;
+            case ACTION_OPEN_PROGRESSION:
+                ShowMenu(player, item->GetGUID(), PAGE_PROGRESSION);
+                return;
+            case ACTION_BACK_TO_MAIN:
+                ShowMenu(player, item->GetGUID(), PAGE_MAIN);
+                return;
+            case ACTION_CLOSE:
+                CloseGossipMenuFor(player);
+                return;
+        }
+
+        // Enforce per-option enable/disable via config (menu also hides them, but double-check here)
+        if ((action == ACTION_MORPH || action == ACTION_DEMORPH) && !sConfigMgr->GetOption<bool>("Morph", true))
+            return;
+        if (action == ACTION_MOUNT && !sConfigMgr->GetOption<bool>("Mount", true))
+            return;
+        if (action == ACTION_TRAINER && !sConfigMgr->GetOption<bool>("Trainers", true))
+            return;
+        if (action == ACTION_VENDOR && !sConfigMgr->GetOption<bool>("Vendor", true))
+            return;
+        if (action == ACTION_MAILBOX && !sConfigMgr->GetOption<bool>("MailBox", true))
+            return;
+        if (action == ACTION_BANK && !sConfigMgr->GetOption<bool>("Bank", true))
+            return;
+        if (action == ACTION_AUCTION && !sConfigMgr->GetOption<bool>("Auction", true))
+            return;
+        if (action == ACTION_RESET_ALL_INSTANCES && !sConfigMgr->GetOption<bool>("ResetInstances", true))
+            return;
+
+        // Charge AP (if non-premium)
+        if (action == ACTION_RESET_ALL_INSTANCES)
+        {
+            if (!TrySpendAPForActionAny(player, action))
             {
+                ShowMenu(player, item->GetGUID(), PAGE_MAIN);
+                return;
+            }
+        }
+        else if (!TrySpendAPForAction(player, action))
+        {
+            ShowMenu(player, item->GetGUID(), PAGE_MAIN);
+            return;
+        }
+
+        switch (action)
+        {
+            case ACTION_IP_SKIP_PHASE:
+            {
+                CloseGossipMenuFor(player);
+                TrySkipIPPhase(player);
+                return;
+            }
+            case ACTION_IP_SKIP_EXPANSION:
+            {
+                CloseGossipMenuFor(player);
+                TrySkipIPExpansion(player);
+                return;
+            }
+
+            case ACTION_MORPH:
                 CloseGossipMenuFor(player);
                 ApplyRandomMorph(player);
-                break;
-            }
-            case GOSSIP_ACTION_INFO_DEF + 2: /*Demorph*/
-            {
+                return;
+            case ACTION_DEMORPH:
                 player->DeMorph();
                 CloseGossipMenuFor(player);
-                break;
-            }
-            case GOSSIP_ACTION_INFO_DEF + 3: /*Show Bank*/
-            {
-                player->GetSession()->SendShowBank(player->GetGUID());
-                break;
-            }
-            case GOSSIP_ACTION_INFO_DEF + 4: /*Mail Box*/
-            {
-                player->GetSession()->SendShowMailBox(player->GetGUID());
-                break;
-            }
-            case GOSSIP_ACTION_INFO_DEF + 5: /*Vendor*/
-            {
-                uint32 vendorId = 0;
-                std::string salute;
+                return;
 
-                if (player->GetTeamId() == TEAM_ALLIANCE)
-                {
-                    vendorId = NPC_VENDOR_A;
-                    switch (player->GetSession()->GetSessionDbLocaleIndex())
-                    {
-                    case LOCALE_enUS:
-                    case LOCALE_koKR:
-                    case LOCALE_frFR:
-                    case LOCALE_deDE:
-                    case LOCALE_zhCN:
-                    case LOCALE_zhTW:
-                    case LOCALE_ruRU:
-                    {
-                        salute = "Greetings";
-                        break;
-                    }
-                    case LOCALE_esES:
-                    case LOCALE_esMX:
-                    {
-                        salute = "Saludos.";
-                    }
-                    default:
-                        break;
-                    }
-                }
-                else
-                {
-                    vendorId = NPC_VENDOR_H;
-                    salute = "Zug zug";
-                }
-
-                SummonTempNPC(player, vendorId, salute.c_str());
-                CloseGossipMenuFor(player);
-                break;
-            }
-            case GOSSIP_ACTION_INFO_DEF + 6: /*Mount*/
+            case ACTION_MOUNT:
             {
                 CloseGossipMenuFor(player);
                 switch (player->getRace())
@@ -219,128 +876,101 @@ public:
                     case RACE_TAUREN:        player->CastSpell(player, TAUREN_MOUNT); break;
                     case RACE_TROLL:         player->CastSpell(player, TROLL_MOUNT); break;
                     case RACE_BLOODELF:      player->CastSpell(player, BLOODELF_MOUNT); break;
+                    default: break;
                 }
-                break;
+                return;
             }
-            case GOSSIP_ACTION_INFO_DEF + 7: /*Auction House*/
-            {
-                uint32 auctionId = 0;
-                std::string salute = "";
-                if (player->GetTeamId() == TEAM_HORDE)
-                {
-                    auctionId = NPC_AUCTION_H;
-                    switch (player->GetSession()->GetSessionDbLocaleIndex())
-                    {
-                    case LOCALE_enUS:
-                    case LOCALE_koKR:
-                    case LOCALE_frFR:
-                    case LOCALE_deDE:
-                    case LOCALE_zhCN:
-                    case LOCALE_zhTW:
-                    case LOCALE_ruRU:
-                    {
-                        salute = "I will go shortly, I need to get back to Orgrimmar";
-                        break;
-                    }
-                    case LOCALE_esES:
-                    case LOCALE_esMX:
-                    {
-                        salute = "Me iré en breve, necesito volver a Orgrimmar.";
-                    }
-                    default:
-                        break;
-                    }
-                }
-                else
-                {
-                    auctionId = NPC_AUCTION_A;
-                    switch (player->GetSession()->GetSessionDbLocaleIndex())
-                    {
-                    case LOCALE_enUS:
-                    case LOCALE_koKR:
-                    case LOCALE_frFR:
-                    case LOCALE_deDE:
-                    case LOCALE_zhCN:
-                    case LOCALE_zhTW:
-                    case LOCALE_ruRU:
-                    {
-                        salute = "I will go shortly, I need to get back to Stormwind City";
-                        break;
-                    }
-                    case LOCALE_esES:
-                    case LOCALE_esMX:
-                    {
-                        salute = "Me iré en breve, necesito volver a la Ciudad de Ventormenta.";
-                    }
-                    default:
-                        break;
-                    }
-                }
 
-                SummonTempNPC(player, auctionId, salute.c_str());
+            case ACTION_BANK:
+                player->GetSession()->SendShowBank(player->GetGUID());
+                return;
+            case ACTION_MAILBOX:
+                player->GetSession()->SendShowMailBox(player->GetGUID());
+                return;
+
+            case ACTION_VENDOR:
+            {
+                uint32 vendorId = player->GetTeamId() == TEAM_ALLIANCE ? NPC_VENDOR_A : NPC_VENDOR_H;
+                std::string salute = player->GetTeamId() == TEAM_ALLIANCE ? "Greetings" : "Zug zug";
+                SummonTempNPC(player, vendorId, salute.c_str());
                 CloseGossipMenuFor(player);
-                break;
+                return;
             }
-            case GOSSIP_ACTION_INFO_DEF + 8: /* Class Trainers*/
+
+            case ACTION_AUCTION:
+            {
+                uint32 auctionId = player->GetTeamId() == TEAM_ALLIANCE ? NPC_AUCTION_A : NPC_AUCTION_H;
+                SummonTempNPC(player, auctionId);
+                CloseGossipMenuFor(player);
+                return;
+            }
+
+            case ACTION_TRAINER:
             {
                 uint32 trainerId = 0;
                 switch (player->getClass())
                 {
-                    case CLASS_ROGUE:
-                        trainerId = player->GetTeamId() == TEAM_ALLIANCE ? ROGUE_A : ROGUE_H;
-                        break;
-                    case CLASS_WARRIOR:
-                        trainerId = player->GetTeamId() == TEAM_ALLIANCE ? WARRIOR_A : WARRIOR_H;
-                        break;
-                    case CLASS_PRIEST:
-                        trainerId = player->GetTeamId() == TEAM_ALLIANCE ? PRIEST_A : PRIEST_H;
-                        break;
-                    case CLASS_MAGE:
-                        trainerId = player->GetTeamId() == TEAM_ALLIANCE ? MAGE_A : MAGE_H;
-                        break;
-                    case CLASS_PALADIN:
-                        trainerId = player->GetTeamId() == TEAM_ALLIANCE ? PALADIN_A : PALADIN_H;
-                        break;
-                    case CLASS_HUNTER:
-                        trainerId = player->GetTeamId() == TEAM_ALLIANCE ? HUNTER_A : HUNTER_H;
-                        break;
-                    case CLASS_DRUID:
-                        trainerId = player->GetTeamId() == TEAM_ALLIANCE ? DRUID_A : DRUID_H;
-                        break;
-                    case CLASS_SHAMAN:
-                        trainerId = player->GetTeamId() == TEAM_ALLIANCE ? SHAMAN_A : SHAMAN_H;
-                        break;
-                    case CLASS_WARLOCK:
-                        trainerId = player->GetTeamId() == TEAM_ALLIANCE ? WARLOCK_A : WARLOCK_H;
-                        break;
-                    case CLASS_DEATH_KNIGHT:
-                        trainerId = DEATHKNIGHT_AH;
-                        break;
+                    case CLASS_ROGUE:        trainerId = player->GetTeamId() == TEAM_ALLIANCE ? ROGUE_A : ROGUE_H; break;
+                    case CLASS_WARRIOR:      trainerId = player->GetTeamId() == TEAM_ALLIANCE ? WARRIOR_A : WARRIOR_H; break;
+                    case CLASS_PRIEST:       trainerId = player->GetTeamId() == TEAM_ALLIANCE ? PRIEST_A : PRIEST_H; break;
+                    case CLASS_MAGE:         trainerId = player->GetTeamId() == TEAM_ALLIANCE ? MAGE_A : MAGE_H; break;
+                    case CLASS_PALADIN:      trainerId = player->GetTeamId() == TEAM_ALLIANCE ? PALADIN_A : PALADIN_H; break;
+                    case CLASS_HUNTER:       trainerId = player->GetTeamId() == TEAM_ALLIANCE ? HUNTER_A : HUNTER_H; break;
+                    case CLASS_DRUID:        trainerId = player->GetTeamId() == TEAM_ALLIANCE ? DRUID_A : DRUID_H; break;
+                    case CLASS_SHAMAN:       trainerId = player->GetTeamId() == TEAM_ALLIANCE ? SHAMAN_A : SHAMAN_H; break;
+                    case CLASS_WARLOCK:      trainerId = player->GetTeamId() == TEAM_ALLIANCE ? WARLOCK_A : WARLOCK_H; break;
+                    case CLASS_DEATH_KNIGHT: trainerId = DEATHKNIGHT_AH; break;
+                    default: break;
                 }
 
                 SummonTempNPC(player, trainerId);
                 CloseGossipMenuFor(player);
-                break;
+                return;
             }
-            case GOSSIP_ACTION_INFO_DEF + 9: /*Player Interactions*/
+
+            case ACTION_TP_STORMWIND:
+                TeleportPlayer(player, TpLocation{0, -8842.09f, 626.358f, 94.0867f, 0.0f});
+                return;
+            case ACTION_TP_IRONFORGE:
+                TeleportPlayer(player, TpLocation{0, -4981.25f, -881.542f, 501.66f, 0.0f});
+                return;
+            case ACTION_TP_DARNASSUS:
+                TeleportPlayer(player, TpLocation{1, 9951.52f, 2280.32f, 1341.39f, 0.0f});
+                return;
+            case ACTION_TP_EXODAR:
+                TeleportPlayer(player, TpLocation{530, -3864.92f, -11643.7f, -137.644f, 0.0f});
+                return;
+
+            case ACTION_TP_ORGRIMMAR:
+                TeleportPlayer(player, TpLocation{1, 1502.71f, -4415.42f, 21.56f, 0.0f});
+                return;
+            case ACTION_TP_UNDERCITY:
+                TeleportPlayer(player, TpLocation{0, 1831.26f, 238.53f, 60.5f, 0.0f});
+                return;
+            case ACTION_TP_THUNDERBLUFF:
+                TeleportPlayer(player, TpLocation{1, -1277.37f, 124.804f, 131.287f, 0.0f});
+                return;
+            case ACTION_TP_SILVERMOON:
+                TeleportPlayer(player, TpLocation{530, 9473.03f, -7279.67f, 14.2285f, 0.0f});
+                return;
+
+            case ACTION_RESET_ALL_INSTANCES:
             {
-                ClearGossipMenuFor(player);
+                CloseGossipMenuFor(player);
 
-                if (sConfigMgr->GetOption<bool>("Vendor", true))
-                    AddGossipItemFor(player, PREMIUM_MENU, GOSSIP_VENDOR, GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF + 5);
+                // Dungeons (normal instances)
+                Player::ResetInstances(player->GetGUID(), INSTANCE_RESET_ALL, false);
+                // Raids (current raid difficulty)
+                Player::ResetInstances(player->GetGUID(), INSTANCE_RESET_CHANGE_DIFFICULTY, true);
 
-                if (sConfigMgr->GetOption<bool>("MailBox", true))
-                    AddGossipItemFor(player, PREMIUM_MENU, GOSSIP_MAIL, GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF + 4);
-
-                if (sConfigMgr->GetOption<bool>("Bank", true))
-                    AddGossipItemFor(player, PREMIUM_MENU, GOSSIP_BANK, GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF + 3);
-
-                if (sConfigMgr->GetOption<bool>("Auction", true))
-                    AddGossipItemFor(player, PREMIUM_MENU, GOSSIP_AUCTION_HOUSE, GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF + 7);
-
-                SendGossipMenuFor(player, PREMIUM_MENU_TEXT, item->GetGUID());
-                break;
+                ChatHandler(player->GetSession()).SendSysMessage("All dungeons/raids have been reset (where allowed).");
+                return;
             }
+
+            default:
+                // Unknown action -> return to main menu
+                ShowMenu(player, item->GetGUID(), PAGE_MAIN);
+                return;
         }
     }
 
@@ -392,17 +1022,77 @@ public:
         if (npcDuration <= 0) // Safeguard
             npcDuration = 60;
 
-        Creature* npc = player->SummonCreature(entry, player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), 0, TEMPSUMMON_TIMED_DESPAWN_OUT_OF_COMBAT, npcDuration);
+        // Summon a personal service NPC for this player.
+        Creature* npc = player->SummonCreature(entry, player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), 0,
+            TEMPSUMMON_TIMED_DESPAWN, npcDuration);
+        if (!npc)
+            return;
         npc->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_NON_ATTACKABLE);
-        npc->GetMotionMaster()->MoveFollow(player, PET_FOLLOW_DIST, player->GetFollowAngle());
+        npc->SetReactState(REACT_PASSIVE);
         npc->SetFaction(player->GetFaction());
+
+        // Attach the summon to the player so it behaves like a personal helper.
+        npc->SetOwnerGUID(player->GetGUID());
+        npc->GetMotionMaster()->MoveFollow(player, PET_FOLLOW_DIST, player->GetFollowAngle());
 
         if (salute && !(salute[0] == '\0'))
             npc->Whisper(salute, LANG_UNIVERSAL, player, false);
     }
 };
 
+class premium_ap_tracker : public PlayerScript
+{
+public:
+    premium_ap_tracker() : PlayerScript("premium_ap_tracker", { PLAYERHOOK_ON_UPDATE }) { }
+
+    void OnPlayerUpdate(Player* player, uint32 diff) override
+    {
+        if (!player || !player->IsInWorld())
+            return;
+
+        if (!sConfigMgr->GetOption<bool>("Premium.AP.Enabled", true))
+            return;
+
+        // award only while not AFK and not in combat (configurable)
+        if (sConfigMgr->GetOption<bool>("Premium.AP.RequireNotAFK", true) && player->isAFK())
+            return;
+
+        if (sConfigMgr->GetOption<bool>("Premium.AP.RequireNotInCombat", false) && player->IsInCombat())
+            return;
+
+        uint32 storedSecs = GetAccumSeconds(player);
+        uint32 storedMs = GetAccumMilliseconds(player);
+        uint64 totalMs = uint64(storedSecs) * IN_MILLISECONDS + storedMs + diff;
+
+        uint32 secondsPerPoint = sConfigMgr->GetOption<uint32>("Premium.AP.SecondsPerPoint", 3600);
+        uint32 pointsPerAward = sConfigMgr->GetOption<uint32>("Premium.AP.PointsPerAward", 1);
+
+        if (secondsPerPoint == 0)
+            secondsPerPoint = 3600;
+
+        uint64 secondsTotal = totalMs / IN_MILLISECONDS;
+        if (secondsTotal >= secondsPerPoint)
+        {
+            uint32 awards = uint32(secondsTotal / secondsPerPoint);
+            uint64 secondsRemainder = secondsTotal % secondsPerPoint;
+            uint64 msRemainder = totalMs % IN_MILLISECONDS;
+            totalMs = secondsRemainder * IN_MILLISECONDS + msRemainder;
+
+            uint32 add = awards * pointsPerAward;
+            uint32 ap = GetAP(player);
+            SetAP(player, ap + add);
+
+            if (sConfigMgr->GetOption<bool>("Premium.AP.Notify", true))
+                ChatHandler(player->GetSession()).PSendSysMessage("You earned {} Echo Coins (EC). Total: {} EC.", add, ap + add);
+        }
+
+        SetAccumSeconds(player, uint32(totalMs / IN_MILLISECONDS));
+        SetAccumMilliseconds(player, uint32(totalMs % IN_MILLISECONDS));
+    }
+};
+
 void AddPremiumAccount()
 {
     new premium_account();
+    new premium_ap_tracker();
 }
