@@ -83,7 +83,8 @@ enum PremiumPage : uint32
     PAGE_TRAVEL,
     PAGE_CHARACTER,
     PAGE_MOUNT,
-    PAGE_PROGRESSION
+    PAGE_PROGRESSION,
+    PAGE_PROFESSIONS
 };
 
 enum PremiumAction : uint32
@@ -95,6 +96,7 @@ enum PremiumAction : uint32
     ACTION_OPEN_MOUNT = GOSSIP_ACTION_INFO_DEF + 14,
 
     ACTION_OPEN_PROGRESSION = GOSSIP_ACTION_INFO_DEF + 15,
+    ACTION_OPEN_PROFESSIONS = GOSSIP_ACTION_INFO_DEF + 16,
 
     ACTION_BACK_TO_MAIN = GOSSIP_ACTION_INFO_DEF + 20,
     ACTION_CLOSE = GOSSIP_ACTION_INFO_DEF + 21,
@@ -129,6 +131,19 @@ enum PremiumAction : uint32
     ACTION_TP_UNDERCITY = GOSSIP_ACTION_INFO_DEF + 71,
     ACTION_TP_THUNDERBLUFF = GOSSIP_ACTION_INFO_DEF + 72,
     ACTION_TP_SILVERMOON = GOSSIP_ACTION_INFO_DEF + 73,
+
+    // Professions (buy max skill)
+    ACTION_PROFESSION_BUY_ALCHEMY = GOSSIP_ACTION_INFO_DEF + 200,
+    ACTION_PROFESSION_BUY_BLACKSMITHING,
+    ACTION_PROFESSION_BUY_ENCHANTING,
+    ACTION_PROFESSION_BUY_ENGINEERING,
+    ACTION_PROFESSION_BUY_HERBALISM,
+    ACTION_PROFESSION_BUY_INSCRIPTION,
+    ACTION_PROFESSION_BUY_JEWELCRAFTING,
+    ACTION_PROFESSION_BUY_LEATHERWORKING,
+    ACTION_PROFESSION_BUY_MINING,
+    ACTION_PROFESSION_BUY_SKINNING,
+    ACTION_PROFESSION_BUY_TAILORING,
 };
 
 struct TpLocation
@@ -534,6 +549,160 @@ namespace
         ChatHandler(player->GetSession()).PSendSysMessage("Progression advanced to expansion milestone. New phase: {}.", targetState);
         return true;
     }
+
+    static uint32 GetProfessionCostEC()
+    {
+        return 20;
+    }
+
+    static bool IsPlayerInTbcBucket(Player* player)
+    {
+        return GetIPStateSafe(player) >= PROGRESSION_PRE_TBC;
+    }
+
+    static bool IsPlayerInWotlkBucket(Player* player)
+    {
+        return GetIPStateSafe(player) >= PROGRESSION_TBC_TIER_5;
+    }
+
+    static uint16 GetMaxProfessionSkillForPlayer(Player* player)
+    {
+        // Vanilla: 300, TBC: 375, WotLK: 450
+        if (IsPlayerInWotlkBucket(player))
+            return 450;
+        if (IsPlayerInTbcBucket(player))
+            return 375;
+        return 300;
+    }
+
+    static uint32 GetProfessionBaseSpell(SkillType skill)
+    {
+        // Base spells that make a profession usable (add the ability button, etc.)
+        switch (skill)
+        {
+            case SKILL_ALCHEMY: return 2259;
+            case SKILL_BLACKSMITHING: return 2018;
+            case SKILL_ENCHANTING: return 7411;
+            case SKILL_ENGINEERING: return 4036;
+            case SKILL_TAILORING: return 3908;
+            case SKILL_LEATHERWORKING: return 2108;
+            case SKILL_JEWELCRAFTING: return 25229;
+            case SKILL_INSCRIPTION: return 45357;
+            case SKILL_MINING: return 2575;
+            case SKILL_HERBALISM: return 2366;
+            case SKILL_SKINNING: return 8613;
+            default: return 0;
+        }
+    }
+
+    static bool IsPrimaryProfession(SkillType skill)
+    {
+        switch (skill)
+        {
+            case SKILL_ALCHEMY:
+            case SKILL_BLACKSMITHING:
+            case SKILL_ENCHANTING:
+            case SKILL_ENGINEERING:
+            case SKILL_LEATHERWORKING:
+            case SKILL_TAILORING:
+            case SKILL_JEWELCRAFTING:
+            case SKILL_INSCRIPTION:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static uint32 GetMaxPrimaryProfessions()
+    {
+        // Core config (worldserver.conf): MaxPrimaryTradeSkill
+        return sConfigMgr->GetOption<uint32>("MaxPrimaryTradeSkill", 3);
+    }
+
+    static uint32 CountPrimaryProfessions(Player* player)
+    {
+        if (!player)
+            return 0;
+
+        uint32 count = 0;
+        if (player->HasSkill(SKILL_ALCHEMY)) ++count;
+        if (player->HasSkill(SKILL_BLACKSMITHING)) ++count;
+        if (player->HasSkill(SKILL_ENCHANTING)) ++count;
+        if (player->HasSkill(SKILL_ENGINEERING)) ++count;
+        if (player->HasSkill(SKILL_LEATHERWORKING)) ++count;
+        if (player->HasSkill(SKILL_TAILORING)) ++count;
+        if (player->HasSkill(SKILL_JEWELCRAFTING)) ++count;
+        if (player->HasSkill(SKILL_INSCRIPTION)) ++count;
+        return count;
+    }
+
+    static void EnsureProfessionBase(Player* player, SkillType skill)
+    {
+        if (!player)
+            return;
+
+        if (uint32 spellId = GetProfessionBaseSpell(skill))
+            if (!player->HasSpell(spellId))
+                player->learnSpell(spellId);
+    }
+
+    static bool LearnProfessionAtMax(Player* player, SkillType skill)
+    {
+        if (!player)
+            return false;
+
+        uint16 maxSkill = GetMaxProfessionSkillForPlayer(player);
+        if (maxSkill < 1)
+            return false;
+
+        EnsureProfessionBase(player, skill);
+
+        player->SetSkill(skill, 1, maxSkill, maxSkill);
+
+        ChatHandler(player->GetSession()).PSendSysMessage("Learned {} at skill {}.", uint32(skill), maxSkill);
+        return true;
+    }
+
+    static bool HandleBuyProfession(Player* player, SkillType skill)
+    {
+        if (!player)
+            return false;
+
+        if (IsPrimaryProfession(skill))
+        {
+            uint32 maxPrimary = GetMaxPrimaryProfessions();
+            uint32 currentPrimary = CountPrimaryProfessions(player);
+
+            if (!player->HasSkill(skill) && currentPrimary >= maxPrimary)
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "You already have the maximum number of primary professions ({}).", maxPrimary);
+                return false;
+            }
+        }
+
+        if (!sConfigMgr->GetOption<bool>("Premium.AP.Enabled", true))
+            return false;
+
+        uint32 cost = GetProfessionCostEC();
+        uint32 ap = GetAP(player);
+        if (ap < cost)
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage("Not enough Echo Coins (EC). You have {} EC, need {} EC.", ap, cost);
+            return false;
+        }
+
+        SetAP(player, ap - cost);
+        ChatHandler(player->GetSession()).PSendSysMessage("Spent {} EC. Remaining: {} EC.", cost, ap - cost);
+
+        return LearnProfessionAtMax(player, skill);
+    }
+
+    static std::string ProfessionLabel(std::string const& base, Player* player)
+    {
+        uint16 maxSkill = GetMaxProfessionSkillForPlayer(player);
+        return base + " (" + std::to_string(maxSkill) + ")";
+    }
 }
 
 static bool PremiumCanUse(Player* player)
@@ -598,6 +767,9 @@ static void ShowMenu(Player* player, ObjectGuid ownerGuid, uint32 page)
 
             if (sConfigMgr->GetOption<bool>("Mount", true))
                 AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG, "Mount", GOSSIP_SENDER_MAIN, ACTION_OPEN_MOUNT);
+
+            if (sConfigMgr->GetOption<bool>("Premium.Professions.Enabled", true))
+                AddGossipItemFor(player, GOSSIP_ICON_TRAINER, "Professions", GOSSIP_SENDER_MAIN, ACTION_OPEN_PROFESSIONS);
 
             AddNavClose(player);
             break;
@@ -706,6 +878,31 @@ static void ShowMenu(Player* player, ObjectGuid ownerGuid, uint32 page)
             AddNavBack(player);
             break;
         }
+
+        case PAGE_PROFESSIONS:
+        {
+            uint16 maxSkill = GetMaxProfessionSkillForPlayer(player);
+
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                "Buy / Max Profession (no recipes) [" + std::to_string(GetProfessionCostEC()) + " EC]",
+                GOSSIP_SENDER_MAIN, ACTION_BACK_TO_MAIN);
+
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, ProfessionLabel("Alchemy", player), GOSSIP_SENDER_MAIN, ACTION_PROFESSION_BUY_ALCHEMY);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, ProfessionLabel("Blacksmithing", player), GOSSIP_SENDER_MAIN, ACTION_PROFESSION_BUY_BLACKSMITHING);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, ProfessionLabel("Enchanting", player), GOSSIP_SENDER_MAIN, ACTION_PROFESSION_BUY_ENCHANTING);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, ProfessionLabel("Engineering", player), GOSSIP_SENDER_MAIN, ACTION_PROFESSION_BUY_ENGINEERING);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, ProfessionLabel("Herbalism", player), GOSSIP_SENDER_MAIN, ACTION_PROFESSION_BUY_HERBALISM);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, ProfessionLabel("Leatherworking", player), GOSSIP_SENDER_MAIN, ACTION_PROFESSION_BUY_LEATHERWORKING);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, ProfessionLabel("Mining", player), GOSSIP_SENDER_MAIN, ACTION_PROFESSION_BUY_MINING);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, ProfessionLabel("Skinning", player), GOSSIP_SENDER_MAIN, ACTION_PROFESSION_BUY_SKINNING);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, ProfessionLabel("Tailoring", player), GOSSIP_SENDER_MAIN, ACTION_PROFESSION_BUY_TAILORING);
+
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, ProfessionLabel("Jewelcrafting", player), GOSSIP_SENDER_MAIN, ACTION_PROFESSION_BUY_JEWELCRAFTING);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, ProfessionLabel("Inscription", player), GOSSIP_SENDER_MAIN, ACTION_PROFESSION_BUY_INSCRIPTION);
+
+            AddNavBack(player);
+            break;
+        }
     }
 
     SendGossipMenuFor(player, PREMIUM_MENU_TEXT, ownerGuid);
@@ -796,6 +993,9 @@ public:
             case ACTION_OPEN_PROGRESSION:
                 ShowMenu(player, item->GetGUID(), PAGE_PROGRESSION);
                 return;
+            case ACTION_OPEN_PROFESSIONS:
+                ShowMenu(player, item->GetGUID(), PAGE_PROFESSIONS);
+                return;
             case ACTION_BACK_TO_MAIN:
                 ShowMenu(player, item->GetGUID(), PAGE_MAIN);
                 return;
@@ -821,6 +1021,57 @@ public:
             return;
         if (action == ACTION_RESET_ALL_INSTANCES && !sConfigMgr->GetOption<bool>("ResetInstances", true))
             return;
+
+        // Professions: handle separately so it always costs EC and doesn't fall through to default.
+        switch (action)
+        {
+            case ACTION_PROFESSION_BUY_ALCHEMY:
+                CloseGossipMenuFor(player);
+                HandleBuyProfession(player, SKILL_ALCHEMY);
+                return;
+            case ACTION_PROFESSION_BUY_BLACKSMITHING:
+                CloseGossipMenuFor(player);
+                HandleBuyProfession(player, SKILL_BLACKSMITHING);
+                return;
+            case ACTION_PROFESSION_BUY_ENCHANTING:
+                CloseGossipMenuFor(player);
+                HandleBuyProfession(player, SKILL_ENCHANTING);
+                return;
+            case ACTION_PROFESSION_BUY_ENGINEERING:
+                CloseGossipMenuFor(player);
+                HandleBuyProfession(player, SKILL_ENGINEERING);
+                return;
+            case ACTION_PROFESSION_BUY_HERBALISM:
+                CloseGossipMenuFor(player);
+                HandleBuyProfession(player, SKILL_HERBALISM);
+                return;
+            case ACTION_PROFESSION_BUY_LEATHERWORKING:
+                CloseGossipMenuFor(player);
+                HandleBuyProfession(player, SKILL_LEATHERWORKING);
+                return;
+            case ACTION_PROFESSION_BUY_MINING:
+                CloseGossipMenuFor(player);
+                HandleBuyProfession(player, SKILL_MINING);
+                return;
+            case ACTION_PROFESSION_BUY_SKINNING:
+                CloseGossipMenuFor(player);
+                HandleBuyProfession(player, SKILL_SKINNING);
+                return;
+            case ACTION_PROFESSION_BUY_TAILORING:
+                CloseGossipMenuFor(player);
+                HandleBuyProfession(player, SKILL_TAILORING);
+                return;
+            case ACTION_PROFESSION_BUY_JEWELCRAFTING:
+                CloseGossipMenuFor(player);
+                HandleBuyProfession(player, SKILL_JEWELCRAFTING);
+                return;
+            case ACTION_PROFESSION_BUY_INSCRIPTION:
+                CloseGossipMenuFor(player);
+                HandleBuyProfession(player, SKILL_INSCRIPTION);
+                return;
+            default:
+                break;
+        }
 
         // Charge AP (if non-premium)
         if (action == ACTION_RESET_ALL_INSTANCES)
