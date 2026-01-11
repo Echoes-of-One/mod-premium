@@ -117,6 +117,10 @@ enum PremiumAction : uint32
     ACTION_BUY_EC_1 = GOSSIP_ACTION_INFO_DEF + 34,
     ACTION_FREE_REPAIR = GOSSIP_ACTION_INFO_DEF + 35,
 
+    ACTION_CHARACTER_CUSTOMIZE = GOSSIP_ACTION_INFO_DEF + 100,
+    ACTION_CHARACTER_CHANGE_RACE = GOSSIP_ACTION_INFO_DEF + 101,
+    ACTION_CHARACTER_CHANGE_FACTION = GOSSIP_ACTION_INFO_DEF + 102,
+
     // Individual Progression
     ACTION_IP_SKIP_PHASE = GOSSIP_ACTION_INFO_DEF + 36,
     ACTION_IP_SKIP_EXPANSION = GOSSIP_ACTION_INFO_DEF + 37,
@@ -301,6 +305,10 @@ namespace
             case ACTION_MOUNT: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Mount", 2);
             case ACTION_RESET_ALL_INSTANCES: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.ResetAllInstances", 10);
 
+            case ACTION_CHARACTER_CUSTOMIZE: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Customize", 5);
+            case ACTION_CHARACTER_CHANGE_RACE: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.ChangeRace", 10);
+            case ACTION_CHARACTER_CHANGE_FACTION: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.ChangeFaction", 15);
+
             case ACTION_FREE_REPAIR: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Repair", 2);
 
             case ACTION_IP_SKIP_PHASE: return 5;
@@ -390,7 +398,10 @@ namespace
             return false;
 
         // Progression skips always cost EC, even for Premium accounts.
-        if (IsPremium(player) && action != ACTION_IP_SKIP_PHASE && action != ACTION_IP_SKIP_EXPANSION)
+        // Character services also always cost EC.
+        if (IsPremium(player)
+            && action != ACTION_IP_SKIP_PHASE && action != ACTION_IP_SKIP_EXPANSION
+            && action != ACTION_CHARACTER_CUSTOMIZE && action != ACTION_CHARACTER_CHANGE_RACE && action != ACTION_CHARACTER_CHANGE_FACTION)
             return true;
 
         if (!sConfigMgr->GetOption<bool>("Premium.AP.Enabled", true))
@@ -1073,6 +1084,13 @@ static void ShowMenu(Player* player, ObjectGuid ownerGuid, uint32 page)
             if (sConfigMgr->GetOption<bool>("ResetInstances", true))
                 AddGossipItemFor(player, GOSSIP_ICON_CHAT, LabelWithCostAny(player, "Reset all dungeons/raids", ACTION_RESET_ALL_INSTANCES), GOSSIP_SENDER_MAIN, ACTION_RESET_ALL_INSTANCES);
 
+            if (sConfigMgr->GetOption<bool>("Premium.CharacterServices.Enabled", true))
+            {
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, LabelWithCostAny(player, "Recustomize", ACTION_CHARACTER_CUSTOMIZE), GOSSIP_SENDER_MAIN, ACTION_CHARACTER_CUSTOMIZE);
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, LabelWithCostAny(player, "Change race", ACTION_CHARACTER_CHANGE_RACE), GOSSIP_SENDER_MAIN, ACTION_CHARACTER_CHANGE_RACE);
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, LabelWithCostAny(player, "Change faction", ACTION_CHARACTER_CHANGE_FACTION), GOSSIP_SENDER_MAIN, ACTION_CHARACTER_CHANGE_FACTION);
+            }
+
             AddNavBack(player);
             break;
         }
@@ -1333,6 +1351,24 @@ public:
                 CloseGossipMenuFor(player);
                 player->DurabilityRepairAll(false, 0.0f, false);
                 ChatHandler(player->GetSession()).SendSysMessage("All items repaired.");
+                return;
+
+            case ACTION_CHARACTER_CUSTOMIZE:
+                CloseGossipMenuFor(player);
+                player->SetAtLoginFlag(AT_LOGIN_CUSTOMIZE);
+                ChatHandler(player->GetSession()).SendSysMessage("Recustomize purchased. Log out to the character selection screen to apply it.");
+                return;
+
+            case ACTION_CHARACTER_CHANGE_RACE:
+                CloseGossipMenuFor(player);
+                player->SetAtLoginFlag(AT_LOGIN_CHANGE_RACE);
+                ChatHandler(player->GetSession()).SendSysMessage("Race change purchased. Log out to the character selection screen to apply it.");
+                return;
+
+            case ACTION_CHARACTER_CHANGE_FACTION:
+                CloseGossipMenuFor(player);
+                player->SetAtLoginFlag(AT_LOGIN_CHANGE_FACTION);
+                ChatHandler(player->GetSession()).SendSysMessage("Faction change purchased. Log out to the character selection screen to apply it.");
                 return;
 
             case ACTION_IP_SKIP_PHASE:
