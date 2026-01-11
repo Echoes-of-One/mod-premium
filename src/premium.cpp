@@ -84,7 +84,8 @@ enum PremiumPage : uint32
     PAGE_CHARACTER,
     PAGE_MOUNT,
     PAGE_PROGRESSION,
-    PAGE_PROFESSIONS
+    PAGE_PROFESSIONS,
+    PAGE_BUFFS
 };
 
 enum PremiumAction : uint32
@@ -97,6 +98,11 @@ enum PremiumAction : uint32
 
     ACTION_OPEN_PROGRESSION = GOSSIP_ACTION_INFO_DEF + 15,
     ACTION_OPEN_PROFESSIONS = GOSSIP_ACTION_INFO_DEF + 16,
+    ACTION_OPEN_BUFFS = GOSSIP_ACTION_INFO_DEF + 17,
+
+    // Buffs
+    ACTION_BUFF_ME_MELEE = GOSSIP_ACTION_INFO_DEF + 18,
+    ACTION_BUFF_ME_CASTER = GOSSIP_ACTION_INFO_DEF + 19,
 
     ACTION_BACK_TO_MAIN = GOSSIP_ACTION_INFO_DEF + 20,
     ACTION_CLOSE = GOSSIP_ACTION_INFO_DEF + 21,
@@ -109,10 +115,11 @@ enum PremiumAction : uint32
     // Character
     ACTION_RESET_ALL_INSTANCES = GOSSIP_ACTION_INFO_DEF + 33,
     ACTION_BUY_EC_1 = GOSSIP_ACTION_INFO_DEF + 34,
+    ACTION_FREE_REPAIR = GOSSIP_ACTION_INFO_DEF + 35,
 
     // Individual Progression
-    ACTION_IP_SKIP_PHASE = GOSSIP_ACTION_INFO_DEF + 35,
-    ACTION_IP_SKIP_EXPANSION = GOSSIP_ACTION_INFO_DEF + 36,
+    ACTION_IP_SKIP_PHASE = GOSSIP_ACTION_INFO_DEF + 36,
+    ACTION_IP_SKIP_EXPANSION = GOSSIP_ACTION_INFO_DEF + 37,
 
     // Services
     ACTION_VENDOR = GOSSIP_ACTION_INFO_DEF + 40,
@@ -132,6 +139,9 @@ enum PremiumAction : uint32
     ACTION_TP_THUNDERBLUFF = GOSSIP_ACTION_INFO_DEF + 72,
     ACTION_TP_SILVERMOON = GOSSIP_ACTION_INFO_DEF + 73,
 
+    ACTION_TP_SHATTRATH = GOSSIP_ACTION_INFO_DEF + 74,
+    ACTION_TP_DALARAN = GOSSIP_ACTION_INFO_DEF + 75,
+
     // Professions (buy max skill)
     ACTION_PROFESSION_BUY_ALCHEMY = GOSSIP_ACTION_INFO_DEF + 200,
     ACTION_PROFESSION_BUY_BLACKSMITHING,
@@ -144,6 +154,10 @@ enum PremiumAction : uint32
     ACTION_PROFESSION_BUY_MINING,
     ACTION_PROFESSION_BUY_SKINNING,
     ACTION_PROFESSION_BUY_TAILORING,
+
+    // Professions (confirmation)
+    ACTION_PROFESSION_CONFIRM = GOSSIP_ACTION_INFO_DEF + 230,
+    ACTION_PROFESSION_CANCEL,
 };
 
 struct TpLocation
@@ -286,6 +300,8 @@ namespace
             case ACTION_DEMORPH: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Demorph", 0);
             case ACTION_MOUNT: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Mount", 2);
             case ACTION_RESET_ALL_INSTANCES: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.ResetAllInstances", 10);
+
+            case ACTION_FREE_REPAIR: return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Repair", 2);
 
             case ACTION_IP_SKIP_PHASE: return 5;
             case ACTION_IP_SKIP_EXPANSION: return 15;
@@ -698,10 +714,225 @@ namespace
         return LearnProfessionAtMax(player, skill);
     }
 
+    static SkillType ProfessionSkillFromAction(uint32 action)
+    {
+        switch (action)
+        {
+            case ACTION_PROFESSION_BUY_ALCHEMY: return SKILL_ALCHEMY;
+            case ACTION_PROFESSION_BUY_BLACKSMITHING: return SKILL_BLACKSMITHING;
+            case ACTION_PROFESSION_BUY_ENCHANTING: return SKILL_ENCHANTING;
+            case ACTION_PROFESSION_BUY_ENGINEERING: return SKILL_ENGINEERING;
+            case ACTION_PROFESSION_BUY_HERBALISM: return SKILL_HERBALISM;
+            case ACTION_PROFESSION_BUY_INSCRIPTION: return SKILL_INSCRIPTION;
+            case ACTION_PROFESSION_BUY_JEWELCRAFTING: return SKILL_JEWELCRAFTING;
+            case ACTION_PROFESSION_BUY_LEATHERWORKING: return SKILL_LEATHERWORKING;
+            case ACTION_PROFESSION_BUY_MINING: return SKILL_MINING;
+            case ACTION_PROFESSION_BUY_SKINNING: return SKILL_SKINNING;
+            case ACTION_PROFESSION_BUY_TAILORING: return SKILL_TAILORING;
+            default: return SKILL_NONE;
+        }
+    }
+
+    static void ShowProfessionConfirmMenu(Player* player, ObjectGuid ownerGuid, SkillType skill)
+    {
+        ClearGossipMenuFor(player);
+
+        uint32 cost = GetProfessionCostEC();
+        uint32 maxPrimary = GetMaxPrimaryProfessions();
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+            "Confirm: spend " + std::to_string(cost) + " EC (no refund)",
+            GOSSIP_SENDER_MAIN, ACTION_BACK_TO_MAIN);
+
+        if (IsPrimaryProfession(skill))
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                "Primary professions limit: " + std::to_string(maxPrimary),
+                GOSSIP_SENDER_MAIN, ACTION_BACK_TO_MAIN);
+
+        // Encode the chosen skill in sender so we know what to purchase on confirm.
+        uint32 confirmSender = uint32(skill);
+
+        AddGossipItemFor(player, GOSSIP_ICON_TRAINER, "Confirm purchase", confirmSender, ACTION_PROFESSION_CONFIRM);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Cancel", GOSSIP_SENDER_MAIN, ACTION_PROFESSION_CANCEL);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Back", GOSSIP_SENDER_MAIN, ACTION_OPEN_PROFESSIONS);
+
+        SendGossipMenuFor(player, PREMIUM_MENU_TEXT, ownerGuid);
+    }
+
     static std::string ProfessionLabel(std::string const& base, Player* player)
     {
         uint16 maxSkill = GetMaxProfessionSkillForPlayer(player);
         return base + " (" + std::to_string(maxSkill) + ")";
+    }
+
+    enum BuffSpells : uint32
+    {
+        // WotLK raid buffs (common)
+        SPELL_ARCANE_INTELLECT = 42995,
+        SPELL_POWER_WORD_FORTITUDE = 48161,
+        SPELL_MARK_OF_THE_WILD = 48469,
+        // Use single-target Blessing of Kings to avoid group/raid application.
+        SPELL_BLESSING_OF_KINGS = 20217,
+
+        // Warrior shouts
+        SPELL_COMMANDING_SHOUT = 47440,
+
+        // Paladin blessings (WotLK higher ranks)
+        SPELL_BLESSING_OF_MIGHT = 48934,
+        SPELL_BLESSING_OF_WISDOM = 48938,
+        SPELL_BLESSING_OF_SANCTUARY = 25899,
+
+        // Consumption
+        SPELL_FISH_FEAST = 57399,
+        SPELL_FLASK_ENDLESS_RAGE = 53760,
+        SPELL_FLASK_FROST_WYRM = 53755,
+
+        // Sayge's Dark Fortune of Damage (base spell is random 1-10%).
+        // Servers can override this to a specific 10% aura spell if they use a custom spell.
+        SPELL_SAYGES_DARK_FORTUNE_OF_DAMAGE_BASE = 23768
+    };
+
+    static uint32 GetBuffCostEC()
+    {
+        return 5;
+    }
+
+    static void TryBuff(Player* player, uint32 spellId)
+    {
+        if (!player || spellId == 0)
+            return;
+
+        // Always cast explicitly on self.
+        // Use triggered cast to bypass GCD so we can apply multiple buffs in one click.
+        player->CastSpell(player, spellId, TriggerCastFlags(TRIGGERED_FULL_MASK));
+    }
+
+    static void ApplyCommonBuffs(Player* player)
+    {
+        // Only one paladin blessing can be active at a time; apply Kings.
+        TryBuff(player, SPELL_BLESSING_OF_KINGS);
+
+        // Warrior shout
+        TryBuff(player, SPELL_COMMANDING_SHOUT);
+
+        // Other common buffs
+        TryBuff(player, SPELL_MARK_OF_THE_WILD);
+        TryBuff(player, SPELL_POWER_WORD_FORTITUDE);
+        TryBuff(player, SPELL_ARCANE_INTELLECT);
+
+        // Consume buffs
+        TryBuff(player, SPELL_FISH_FEAST);
+
+        // Sayge's Dark Fortune of Damage
+        // The base spell (23768) is random 1-10% on some cores. To force 10% deterministically,
+        // configure Premium.Buffs.SaygeDamageSpellId10 with the spell ID of your 10% variant.
+        uint32 saygeSpell = sConfigMgr->GetOption<uint32>("Premium.Buffs.SaygeDamageSpellId10", SPELL_SAYGES_DARK_FORTUNE_OF_DAMAGE_BASE);
+        TryBuff(player, saygeSpell);
+    }
+
+    static bool TrySpendECForBuff(Player* player)
+    {
+        if (!player)
+            return false;
+
+        if (IsPremium(player))
+            return true;
+
+        if (!sConfigMgr->GetOption<bool>("Premium.AP.Enabled", true))
+            return false;
+
+        uint32 cost = GetBuffCostEC();
+        if (cost == 0)
+            return true;
+
+        uint32 ap = GetAP(player);
+        if (ap < cost)
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage("Not enough Echo Coins (EC). You have {} EC, need {} EC.", ap, cost);
+            return false;
+        }
+
+        SetAP(player, ap - cost);
+        ChatHandler(player->GetSession()).PSendSysMessage("Spent {} EC. Remaining: {} EC.", cost, ap - cost);
+        return true;
+    }
+
+    static void BuffMe(Player* player, bool caster)
+    {
+        if (!player)
+            return;
+
+        if (!TrySpendECForBuff(player))
+            return;
+
+        ApplyCommonBuffs(player);
+        TryBuff(player, caster ? SPELL_FLASK_FROST_WYRM : SPELL_FLASK_ENDLESS_RAGE);
+
+        ChatHandler(player->GetSession()).SendSysMessage("Buffs applied.");
+    }
+
+    static bool TryClearAllInstanceBinds(Player* player)
+    {
+        if (!player)
+            return false;
+
+        // Safety: avoid clearing binds while inside an instance.
+        if (Map* map = player->FindMap())
+        {
+            if (map->IsDungeon())
+            {
+                ChatHandler(player->GetSession()).SendSysMessage("You cannot clear instance binds while inside an instance/raid.");
+                return false;
+            }
+        }
+
+        ObjectGuid guid = player->GetGUID();
+
+        // If enabled, clear permanent (raid) binds too.
+        bool clearPermanent = sConfigMgr->GetOption<bool>("Premium.ResetInstances.ClearPermanent", true);
+
+        uint32 unboundCount = 0;
+        uint32 skippedPermanent = 0;
+
+        for (uint8 d = 0; d < MAX_DIFFICULTY; ++d)
+        {
+            Difficulty diff = Difficulty(d);
+            BoundInstancesMap const& binds = sInstanceSaveMgr->PlayerGetBoundInstances(guid, diff);
+
+            // Copy map ids first; unbinding mutates the underlying storage.
+            std::vector<uint32> mapIds;
+            mapIds.reserve(binds.size());
+
+            for (auto const& kv : binds)
+            {
+                uint32 mapId = kv.first;
+                InstancePlayerBind const& bind = kv.second;
+
+                if (bind.perm && !clearPermanent)
+                {
+                    ++skippedPermanent;
+                    continue;
+                }
+
+                mapIds.push_back(mapId);
+            }
+
+            for (uint32 mapId : mapIds)
+            {
+                sInstanceSaveMgr->PlayerUnbindInstance(guid, mapId, diff, true, player);
+                ++unboundCount;
+            }
+        }
+
+        // Refresh client lockout UI.
+        player->SendRaidInfo();
+
+        if (skippedPermanent)
+            ChatHandler(player->GetSession()).PSendSysMessage("Cleared {} instance binds. Skipped {} permanent lockouts.", unboundCount, skippedPermanent);
+        else
+            ChatHandler(player->GetSession()).PSendSysMessage("Cleared {} instance binds.", unboundCount);
+
+        return true;
     }
 }
 
@@ -762,6 +993,8 @@ static void ShowMenu(Player* player, ObjectGuid ownerGuid, uint32 page)
             AddGossipItemFor(player, GOSSIP_ICON_TAXI, "Travel", GOSSIP_SENDER_MAIN, ACTION_OPEN_TRAVEL);
             AddGossipItemFor(player, GOSSIP_ICON_TRAINER, "Character", GOSSIP_SENDER_MAIN, ACTION_OPEN_CHARACTER);
 
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, "Buffs", GOSSIP_SENDER_MAIN, ACTION_OPEN_BUFFS);
+
             if (sIndividualProgression->enabled && !sIndividualProgression->isExcludedFromProgression(player))
                 AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Progression", GOSSIP_SENDER_MAIN, ACTION_OPEN_PROGRESSION);
 
@@ -772,6 +1005,23 @@ static void ShowMenu(Player* player, ObjectGuid ownerGuid, uint32 page)
                 AddGossipItemFor(player, GOSSIP_ICON_TRAINER, "Professions", GOSSIP_SENDER_MAIN, ACTION_OPEN_PROFESSIONS);
 
             AddNavClose(player);
+            break;
+        }
+
+        case PAGE_BUFFS:
+        {
+            uint32 buffCost = GetBuffCostEC();
+
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Buffs", GOSSIP_SENDER_MAIN, ACTION_BACK_TO_MAIN);
+
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER,
+                (IsPremium(player) ? std::string("Buff Me (Melee) (Premium)") : ("Buff Me (Melee) [" + std::to_string(buffCost) + " EC]")),
+                GOSSIP_SENDER_MAIN, ACTION_BUFF_ME_MELEE);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER,
+                (IsPremium(player) ? std::string("Buff Me (Caster) (Premium)") : ("Buff Me (Caster) [" + std::to_string(buffCost) + " EC]")),
+                GOSSIP_SENDER_MAIN, ACTION_BUFF_ME_CASTER);
+
+            AddNavBack(player);
             break;
         }
 
@@ -817,6 +1067,8 @@ static void ShowMenu(Player* player, ObjectGuid ownerGuid, uint32 page)
                     "Buy 1 EC (" + FormatMoneyCopper(rate) + ")",
                     GOSSIP_SENDER_MAIN, ACTION_BUY_EC_1);
             }
+
+            AddGossipItemFor(player, GOSSIP_ICON_VENDOR, LabelWithCost(player, "Repair", ACTION_FREE_REPAIR), GOSSIP_SENDER_MAIN, ACTION_FREE_REPAIR);
 
             if (sConfigMgr->GetOption<bool>("ResetInstances", true))
                 AddGossipItemFor(player, GOSSIP_ICON_CHAT, LabelWithCostAny(player, "Reset all dungeons/raids", ACTION_RESET_ALL_INSTANCES), GOSSIP_SENDER_MAIN, ACTION_RESET_ALL_INSTANCES);
@@ -867,6 +1119,12 @@ static void ShowMenu(Player* player, ObjectGuid ownerGuid, uint32 page)
                 AddGossipItemFor(player, GOSSIP_ICON_TAXI, LabelWithCost(player, "Thunder Bluff", ACTION_TP_THUNDERBLUFF), GOSSIP_SENDER_MAIN, ACTION_TP_THUNDERBLUFF);
                 AddGossipItemFor(player, GOSSIP_ICON_TAXI, LabelWithCost(player, "Silvermoon", ACTION_TP_SILVERMOON), GOSSIP_SENDER_MAIN, ACTION_TP_SILVERMOON);
             }
+
+            if (IsPlayerInTbcBucket(player))
+                AddGossipItemFor(player, GOSSIP_ICON_TAXI, LabelWithCost(player, "Shattrath", ACTION_TP_SHATTRATH), GOSSIP_SENDER_MAIN, ACTION_TP_SHATTRATH);
+
+            if (IsPlayerInWotlkBucket(player))
+                AddGossipItemFor(player, GOSSIP_ICON_TAXI, LabelWithCost(player, "Dalaran", ACTION_TP_DALARAN), GOSSIP_SENDER_MAIN, ACTION_TP_DALARAN);
 
             AddNavBack(player);
             break;
@@ -953,7 +1211,7 @@ public:
         return true;
     }
 
-    void OnGossipSelect(Player* player, Item* item, uint32 /*sender*/, uint32 action) override
+    void OnGossipSelect(Player* player, Item* item, uint32 sender, uint32 action) override
     {
         if (!player || !item)
             return;
@@ -996,6 +1254,9 @@ public:
             case ACTION_OPEN_PROFESSIONS:
                 ShowMenu(player, item->GetGUID(), PAGE_PROFESSIONS);
                 return;
+            case ACTION_OPEN_BUFFS:
+                ShowMenu(player, item->GetGUID(), PAGE_BUFFS);
+                return;
             case ACTION_BACK_TO_MAIN:
                 ShowMenu(player, item->GetGUID(), PAGE_MAIN);
                 return;
@@ -1022,55 +1283,25 @@ public:
         if (action == ACTION_RESET_ALL_INSTANCES && !sConfigMgr->GetOption<bool>("ResetInstances", true))
             return;
 
-        // Professions: handle separately so it always costs EC and doesn't fall through to default.
-        switch (action)
+        // Profession confirmation handling
+        if (action == ACTION_PROFESSION_CONFIRM)
         {
-            case ACTION_PROFESSION_BUY_ALCHEMY:
-                CloseGossipMenuFor(player);
-                HandleBuyProfession(player, SKILL_ALCHEMY);
-                return;
-            case ACTION_PROFESSION_BUY_BLACKSMITHING:
-                CloseGossipMenuFor(player);
-                HandleBuyProfession(player, SKILL_BLACKSMITHING);
-                return;
-            case ACTION_PROFESSION_BUY_ENCHANTING:
-                CloseGossipMenuFor(player);
-                HandleBuyProfession(player, SKILL_ENCHANTING);
-                return;
-            case ACTION_PROFESSION_BUY_ENGINEERING:
-                CloseGossipMenuFor(player);
-                HandleBuyProfession(player, SKILL_ENGINEERING);
-                return;
-            case ACTION_PROFESSION_BUY_HERBALISM:
-                CloseGossipMenuFor(player);
-                HandleBuyProfession(player, SKILL_HERBALISM);
-                return;
-            case ACTION_PROFESSION_BUY_LEATHERWORKING:
-                CloseGossipMenuFor(player);
-                HandleBuyProfession(player, SKILL_LEATHERWORKING);
-                return;
-            case ACTION_PROFESSION_BUY_MINING:
-                CloseGossipMenuFor(player);
-                HandleBuyProfession(player, SKILL_MINING);
-                return;
-            case ACTION_PROFESSION_BUY_SKINNING:
-                CloseGossipMenuFor(player);
-                HandleBuyProfession(player, SKILL_SKINNING);
-                return;
-            case ACTION_PROFESSION_BUY_TAILORING:
-                CloseGossipMenuFor(player);
-                HandleBuyProfession(player, SKILL_TAILORING);
-                return;
-            case ACTION_PROFESSION_BUY_JEWELCRAFTING:
-                CloseGossipMenuFor(player);
-                HandleBuyProfession(player, SKILL_JEWELCRAFTING);
-                return;
-            case ACTION_PROFESSION_BUY_INSCRIPTION:
-                CloseGossipMenuFor(player);
-                HandleBuyProfession(player, SKILL_INSCRIPTION);
-                return;
-            default:
-                break;
+            CloseGossipMenuFor(player);
+            HandleBuyProfession(player, SkillType(sender));
+            return;
+        }
+
+        if (action == ACTION_PROFESSION_CANCEL)
+        {
+            ShowMenu(player, item->GetGUID(), PAGE_PROFESSIONS);
+            return;
+        }
+
+        // Professions: first show a confirmation page before spending EC.
+        if (SkillType skill = ProfessionSkillFromAction(action); skill != SKILL_NONE)
+        {
+            ShowProfessionConfirmMenu(player, item->GetGUID(), skill);
+            return;
         }
 
         // Charge AP (if non-premium)
@@ -1090,6 +1321,20 @@ public:
 
         switch (action)
         {
+            case ACTION_BUFF_ME_MELEE:
+                CloseGossipMenuFor(player);
+                BuffMe(player, false);
+                return;
+            case ACTION_BUFF_ME_CASTER:
+                CloseGossipMenuFor(player);
+                BuffMe(player, true);
+                return;
+            case ACTION_FREE_REPAIR:
+                CloseGossipMenuFor(player);
+                player->DurabilityRepairAll(false, 0.0f, false);
+                ChatHandler(player->GetSession()).SendSysMessage("All items repaired.");
+                return;
+
             case ACTION_IP_SKIP_PHASE:
             {
                 CloseGossipMenuFor(player);
@@ -1136,8 +1381,44 @@ public:
                 player->GetSession()->SendShowBank(player->GetGUID());
                 return;
             case ACTION_MAILBOX:
-                player->GetSession()->SendShowMailBox(player->GetGUID());
+            {
+                CloseGossipMenuFor(player);
+
+                // Mail list only works when the client opens a valid mailbox GUID (GO or NPC with mailbox flag).
+                // Using the player's GUID will be rejected by CanOpenMailBox for normal players.
+                uint32 mailboxEntry = sConfigMgr->GetOption<uint32>("Premium.MailboxNpcEntry", 0);
+
+                if (mailboxEntry == 0)
+                {
+                    // If not configured, fall back to summoning the faction vendor and force mailbox flag.
+                    // (This relies on being able to talk to the summoned creature, which we allow by setting the flag.)
+                    mailboxEntry = player->GetTeamId() == TEAM_ALLIANCE ? NPC_VENDOR_A : NPC_VENDOR_H;
+                }
+
+                int npcDuration = sConfigMgr->GetOption<int32>("Premium.NpcDuration", 60) * IN_MILLISECONDS;
+                if (npcDuration <= 0)
+                    npcDuration = 60 * IN_MILLISECONDS;
+
+                Creature* npc = player->SummonCreature(mailboxEntry,
+                    player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), 0,
+                    TEMPSUMMON_TIMED_DESPAWN, npcDuration);
+
+                if (!npc)
+                {
+                    ChatHandler(player->GetSession()).SendSysMessage("Could not summon mailbox.");
+                    return;
+                }
+
+                npc->SetFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_MAILBOX);
+                npc->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_NON_ATTACKABLE);
+                npc->SetReactState(REACT_PASSIVE);
+                npc->SetFaction(player->GetFaction());
+                npc->SetOwnerGUID(player->GetGUID());
+                npc->GetMotionMaster()->MoveFollow(player, PET_FOLLOW_DIST, player->GetFollowAngle());
+
+                player->GetSession()->SendShowMailBox(npc->GetGUID());
                 return;
+            }
 
             case ACTION_VENDOR:
             {
@@ -1205,16 +1486,18 @@ public:
                 TeleportPlayer(player, TpLocation{530, 9473.03f, -7279.67f, 14.2285f, 0.0f});
                 return;
 
+            case ACTION_TP_SHATTRATH:
+                TeleportPlayer(player, TpLocation{530, -1835.0618f, 5323.3115f, -12.428f, 5.0f});
+                return;
+            case ACTION_TP_DALARAN:
+                TeleportPlayer(player, TpLocation{571, 5809.55f, 503.98f, 657.57f, 2.0f});
+                return;
+
             case ACTION_RESET_ALL_INSTANCES:
             {
                 CloseGossipMenuFor(player);
 
-                // Dungeons (normal instances)
-                Player::ResetInstances(player->GetGUID(), INSTANCE_RESET_ALL, false);
-                // Raids (current raid difficulty)
-                Player::ResetInstances(player->GetGUID(), INSTANCE_RESET_CHANGE_DIFFICULTY, true);
-
-                ChatHandler(player->GetSession()).SendSysMessage("All dungeons/raids have been reset (where allowed).");
+                TryClearAllInstanceBinds(player);
                 return;
             }
 
