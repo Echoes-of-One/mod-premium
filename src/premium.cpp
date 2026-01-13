@@ -85,7 +85,8 @@ enum PremiumPage : uint32
     PAGE_MOUNT,
     PAGE_PROGRESSION,
     PAGE_PROFESSIONS,
-    PAGE_BUFFS
+    PAGE_BUFFS,
+    PAGE_RATES
 };
 
 enum PremiumAction : uint32
@@ -100,9 +101,20 @@ enum PremiumAction : uint32
     ACTION_OPEN_PROFESSIONS = GOSSIP_ACTION_INFO_DEF + 16,
     ACTION_OPEN_BUFFS = GOSSIP_ACTION_INFO_DEF + 17,
 
+    //Rates
+    ACTION_OPEN_RATES = GOSSIP_ACTION_INFO_DEF + 23,
+    ACTION_SET_XP_RATE_0 = GOSSIP_ACTION_INFO_DEF + 240,
+    ACTION_SET_XP_RATE_1,
+    ACTION_SET_XP_RATE_5,
+    ACTION_SET_XP_RATE_10,
+    ACTION_SET_XP_RATE_25,
+    ACTION_SET_XP_RATE_50,
+    ACTION_SET_XP_RATE_100,
+
     // Buffs
     ACTION_BUFF_ME_MELEE = GOSSIP_ACTION_INFO_DEF + 18,
     ACTION_BUFF_ME_CASTER = GOSSIP_ACTION_INFO_DEF + 19,
+    ACTION_BUFF_ME_TANK = GOSSIP_ACTION_INFO_DEF + 22,
 
     ACTION_BACK_TO_MAIN = GOSSIP_ACTION_INFO_DEF + 20,
     ACTION_CLOSE = GOSSIP_ACTION_INFO_DEF + 21,
@@ -182,8 +194,85 @@ namespace
         SETTING_ACTIVITY_POINTS = 0,
         SETTING_ACTIVITY_SECONDS = 1,
         SETTING_ACTIVITY_MILLISECONDS = 2,
-        MAX_PREMIUM_SETTINGS = 3
+
+        // Persisted personal progression rates (per-character)
+        SETTING_XP_RATE_PERMILLE = 3,          // 0..1000 (1000 = 100.0%)
+        SETTING_PROF_SKILL_RATE_PERMILLE = 4,  // 0..1000
+
+        MAX_PREMIUM_SETTINGS = 5
     };
+
+    // ... keep PremiumPSSource + PremiumSettingIndexes as-is ...
+
+    // Stored value meaning:
+    // 0  = x0.0
+    // 1  = x0.1
+    // 5  = x0.5
+    // 10 = x1.0
+    // 20 = x2.0
+    // 60 = x6.0 (matches your server default rates)
+    static uint32 GetXpRateMultiplierTenths(Player* player)
+    {
+        if (!player)
+            return 10; // x1.0 default
+
+        uint32 v = player->GetPlayerSetting(PremiumPSSource, SETTING_XP_RATE_PERMILLE).value;
+
+        // clamp to something sane; adjust max if you want higher than x10.0
+        if (v > 100)
+            v = 100; // x10.0
+
+        return v;
+    }
+
+    static void SetXpRateMultiplierTenths(Player* player, uint32 tenths)
+    {
+        if (!player)
+            return;
+
+        if (tenths > 100)
+            tenths = 100;
+
+        player->UpdatePlayerSetting(PremiumPSSource, SETTING_XP_RATE_PERMILLE, tenths);
+    }
+
+    static std::string FormatMultiplierLabel(uint32 tenths)
+    {
+        // x0, x1, x2 ... and x0.5, x0.1 etc
+        uint32 whole = tenths / 10;
+        uint32 frac = tenths % 10;
+
+        if (frac == 0)
+            return "x" + std::to_string(whole);
+
+        return "x" + std::to_string(whole) + "." + std::to_string(frac);
+    }
+}
+
+namespace
+{
+    // Re-open anonymous namespace so the existing helper functions below are in the same scope.
+    // This restores compilation without deleting any of your existing code.
+
+    // Compatibility wrapper for older call sites that still use permille.
+    // Converts stored tenths multiplier to permille percent (x1.0 => 1000).
+    static uint32 GetXpRatePermille(Player* player)
+    {
+        uint32 tenths = GetXpRateMultiplierTenths(player);
+        if (tenths > 100)
+            tenths = 100;
+        return tenths * 100; // tenths -> permille
+    }
+
+    static uint32 GetProfSkillRatePermille(Player* player)
+    {
+        // Reuse the same stored tenths multiplier for now (follows XP system)
+        // tenths -> permille (x1.0 => 1000)
+        uint32 tenths = GetXpRateMultiplierTenths(player);
+        if (tenths > 100)
+            tenths = 100;
+        return tenths * 100;
+    }
 
     uint32 GetAP(Player* player);
     void SetAP(Player* player, uint32 ap);
@@ -797,15 +886,28 @@ namespace
         SPELL_FISH_FEAST = 57399,
         SPELL_FLASK_ENDLESS_RAGE = 53760,
         SPELL_FLASK_FROST_WYRM = 53755,
+        SPELL_FLASK_STONEBLOOD = 53758,
 
         // Sayge's Dark Fortune of Damage (base spell is random 1-10%).
         // Servers can override this to a specific 10% aura spell if they use a custom spell.
-        SPELL_SAYGES_DARK_FORTUNE_OF_DAMAGE_BASE = 23768
+        SPELL_SAYGES_DARK_FORTUNE_OF_DAMAGE_BASE = 23768,
+
+        // Darkmoon Faire (Sayge) buffs
+        SPELL_SAYGES_DARK_FORTUNE_OF_AGILITY = 23736,
+        SPELL_SAYGES_DARK_FORTUNE_OF_STRENGTH = 23735,
+        SPELL_SAYGES_DARK_FORTUNE_OF_INTELLIGENCE = 23766,
+        SPELL_SAYGES_DARK_FORTUNE_OF_SPIRIT = 23738,
+        SPELL_SAYGES_DARK_FORTUNE_OF_STAMINA = 23737,
+        SPELL_SAYGES_DARK_FORTUNE_OF_RESISTANCE = 23769,
+        SPELL_SAYGES_DARK_FORTUNE_OF_ARMOR = 23767
     };
 
-    static uint32 GetBuffCostEC()
+    static uint32 GetBuffCostEC(Player* player)
     {
-        return 5;
+        if (player && IsPremium(player))
+            return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Buffs.Premium", 1);
+
+        return sConfigMgr->GetOption<uint32>("Premium.AP.Cost.Buffs", 2);
     }
 
     static void TryBuff(Player* player, uint32 spellId)
@@ -834,6 +936,7 @@ namespace
         // Consume buffs
         TryBuff(player, SPELL_FISH_FEAST);
 
+
         // Sayge's Dark Fortune of Damage
         // The base spell (23768) is random 1-10% on some cores. To force 10% deterministically,
         // configure Premium.Buffs.SaygeDamageSpellId10 with the spell ID of your 10% variant.
@@ -846,13 +949,10 @@ namespace
         if (!player)
             return false;
 
-        if (IsPremium(player))
-            return true;
-
         if (!sConfigMgr->GetOption<bool>("Premium.AP.Enabled", true))
             return false;
 
-        uint32 cost = GetBuffCostEC();
+        uint32 cost = GetBuffCostEC(player);
         if (cost == 0)
             return true;
 
@@ -877,7 +977,38 @@ namespace
             return;
 
         ApplyCommonBuffs(player);
+
+        if (caster)
+        {
+            TryBuff(player, SPELL_SAYGES_DARK_FORTUNE_OF_INTELLIGENCE);
+            TryBuff(player, SPELL_SAYGES_DARK_FORTUNE_OF_SPIRIT);
+        }
+        else
+        {
+            TryBuff(player, SPELL_SAYGES_DARK_FORTUNE_OF_STRENGTH);
+            TryBuff(player, SPELL_SAYGES_DARK_FORTUNE_OF_AGILITY);
+        }
+
         TryBuff(player, caster ? SPELL_FLASK_FROST_WYRM : SPELL_FLASK_ENDLESS_RAGE);
+
+        ChatHandler(player->GetSession()).SendSysMessage("Buffs applied.");
+    }
+
+    static void BuffMeTank(Player* player)
+    {
+        if (!player)
+            return;
+
+        if (!TrySpendECForBuff(player))
+            return;
+
+        ApplyCommonBuffs(player);
+
+        TryBuff(player, SPELL_SAYGES_DARK_FORTUNE_OF_STAMINA);
+        TryBuff(player, SPELL_SAYGES_DARK_FORTUNE_OF_RESISTANCE);
+        TryBuff(player, SPELL_SAYGES_DARK_FORTUNE_OF_ARMOR);
+
+        TryBuff(player, SPELL_FLASK_STONEBLOOD);
 
         ChatHandler(player->GetSession()).SendSysMessage("Buffs applied.");
     }
@@ -1015,22 +1146,27 @@ static void ShowMenu(Player* player, ObjectGuid ownerGuid, uint32 page)
             if (sConfigMgr->GetOption<bool>("Premium.Professions.Enabled", true))
                 AddGossipItemFor(player, GOSSIP_ICON_TRAINER, "Professions", GOSSIP_SENDER_MAIN, ACTION_OPEN_PROFESSIONS);
 
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Rates (XP / Professions)", GOSSIP_SENDER_MAIN, ACTION_OPEN_RATES);
+
             AddNavClose(player);
             break;
         }
 
         case PAGE_BUFFS:
         {
-            uint32 buffCost = GetBuffCostEC();
+            uint32 buffCost = GetBuffCostEC(player);
 
             AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Buffs", GOSSIP_SENDER_MAIN, ACTION_BACK_TO_MAIN);
 
             AddGossipItemFor(player, GOSSIP_ICON_TRAINER,
-                (IsPremium(player) ? std::string("Buff Me (Melee) (Premium)") : ("Buff Me (Melee) [" + std::to_string(buffCost) + " EC]")),
+                (IsPremium(player) ? ("Buff Me (Melee) [" + std::to_string(buffCost) + " EC]") : ("Buff Me (Melee) [" + std::to_string(buffCost) + " EC]")),
                 GOSSIP_SENDER_MAIN, ACTION_BUFF_ME_MELEE);
             AddGossipItemFor(player, GOSSIP_ICON_TRAINER,
-                (IsPremium(player) ? std::string("Buff Me (Caster) (Premium)") : ("Buff Me (Caster) [" + std::to_string(buffCost) + " EC]")),
+                (IsPremium(player) ? ("Buff Me (Caster) [" + std::to_string(buffCost) + " EC]") : ("Buff Me (Caster) [" + std::to_string(buffCost) + " EC]")),
                 GOSSIP_SENDER_MAIN, ACTION_BUFF_ME_CASTER);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER,
+                (IsPremium(player) ? ("Buff Me (Tank) [" + std::to_string(buffCost) + " EC]") : ("Buff Me (Tank) [" + std::to_string(buffCost) + " EC]")),
+                GOSSIP_SENDER_MAIN, ACTION_BUFF_ME_TANK);
 
             AddNavBack(player);
             break;
@@ -1155,6 +1291,28 @@ static void ShowMenu(Player* player, ObjectGuid ownerGuid, uint32 page)
             break;
         }
 
+        case PAGE_RATES:
+        {
+            uint32 xpMulTenths = GetXpRateMultiplierTenths(player);
+
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                "Rates Changer: " + FormatMultiplierLabel(xpMulTenths),
+                GOSSIP_SENDER_MAIN, ACTION_BACK_TO_MAIN);
+
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Set Rates to x0 (no XP)", GOSSIP_SENDER_MAIN, ACTION_SET_XP_RATE_0);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Set Rates to x0.1", GOSSIP_SENDER_MAIN, ACTION_SET_XP_RATE_1);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Set Rates to x0.5", GOSSIP_SENDER_MAIN, ACTION_SET_XP_RATE_5);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Set Rates to x1", GOSSIP_SENDER_MAIN, ACTION_SET_XP_RATE_10);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Set Rates to x2.5", GOSSIP_SENDER_MAIN, ACTION_SET_XP_RATE_25);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Set Rates to x5", GOSSIP_SENDER_MAIN, ACTION_SET_XP_RATE_50);
+
+            // With your server set to 6x globally, x6 here means "keep server pace"
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Set Rates to x6 (server default)", GOSSIP_SENDER_MAIN, ACTION_SET_XP_RATE_100);
+
+            AddNavBack(player);
+            break;
+        }
+
         case PAGE_PROFESSIONS:
         {
             uint16 maxSkill = GetMaxProfessionSkillForPlayer(player);
@@ -1251,37 +1409,48 @@ public:
         // Navigation actions are always free
         switch (action)
         {
-            case ACTION_OPEN_APPEARANCE:
-                ShowMenu(player, item->GetGUID(), PAGE_APPEARANCE);
-                return;
-            case ACTION_OPEN_SERVICES:
-                ShowMenu(player, item->GetGUID(), PAGE_SERVICES);
-                return;
-            case ACTION_OPEN_TRAVEL:
-                ShowMenu(player, item->GetGUID(), PAGE_TRAVEL);
-                return;
-            case ACTION_OPEN_CHARACTER:
-                ShowMenu(player, item->GetGUID(), PAGE_CHARACTER);
-                return;
-            case ACTION_OPEN_MOUNT:
-                ShowMenu(player, item->GetGUID(), PAGE_MOUNT);
-                return;
-            case ACTION_OPEN_PROGRESSION:
-                ShowMenu(player, item->GetGUID(), PAGE_PROGRESSION);
-                return;
-            case ACTION_OPEN_PROFESSIONS:
-                ShowMenu(player, item->GetGUID(), PAGE_PROFESSIONS);
-                return;
-            case ACTION_OPEN_BUFFS:
-                ShowMenu(player, item->GetGUID(), PAGE_BUFFS);
-                return;
-            case ACTION_BACK_TO_MAIN:
-                ShowMenu(player, item->GetGUID(), PAGE_MAIN);
-                return;
-            case ACTION_CLOSE:
-                CloseGossipMenuFor(player);
-                return;
-        }
+        case ACTION_SET_XP_RATE_0:   SetXpRateMultiplierTenths(player, 0);  ShowMenu(player, item->GetGUID(), PAGE_RATES); return;  // x0.0
+        case ACTION_SET_XP_RATE_1:   SetXpRateMultiplierTenths(player, 1);  ShowMenu(player, item->GetGUID(), PAGE_RATES); return;  // x0.1
+        case ACTION_SET_XP_RATE_5:   SetXpRateMultiplierTenths(player, 5);  ShowMenu(player, item->GetGUID(), PAGE_RATES); return;  // x0.5
+        case ACTION_SET_XP_RATE_10:  SetXpRateMultiplierTenths(player, 10); ShowMenu(player, item->GetGUID(), PAGE_RATES); return;  // x1.0
+        case ACTION_SET_XP_RATE_25:  SetXpRateMultiplierTenths(player, 25); ShowMenu(player, item->GetGUID(), PAGE_RATES); return;  // x2.5
+        case ACTION_SET_XP_RATE_50:  SetXpRateMultiplierTenths(player, 50); ShowMenu(player, item->GetGUID(), PAGE_RATES); return;  // x5.0
+        case ACTION_SET_XP_RATE_100: SetXpRateMultiplierTenths(player, 60); ShowMenu(player, item->GetGUID(), PAGE_RATES); return;  // x6.0
+
+        case ACTION_OPEN_APPEARANCE:
+            ShowMenu(player, item->GetGUID(), PAGE_APPEARANCE);
+            return;
+        case ACTION_OPEN_SERVICES:
+            ShowMenu(player, item->GetGUID(), PAGE_SERVICES);
+            return;
+        case ACTION_OPEN_TRAVEL:
+            ShowMenu(player, item->GetGUID(), PAGE_TRAVEL);
+            return;
+        case ACTION_OPEN_CHARACTER:
+            ShowMenu(player, item->GetGUID(), PAGE_CHARACTER);
+            return;
+        case ACTION_OPEN_MOUNT:
+            ShowMenu(player, item->GetGUID(), PAGE_MOUNT);
+            return;
+        case ACTION_OPEN_PROGRESSION:
+            ShowMenu(player, item->GetGUID(), PAGE_PROGRESSION);
+            return;
+        case ACTION_OPEN_PROFESSIONS:
+            ShowMenu(player, item->GetGUID(), PAGE_PROFESSIONS);
+            return;
+        case ACTION_OPEN_BUFFS:
+            ShowMenu(player, item->GetGUID(), PAGE_BUFFS);
+            return;
+        case ACTION_BACK_TO_MAIN:
+            ShowMenu(player, item->GetGUID(), PAGE_MAIN);
+            return;
+        case ACTION_CLOSE:
+            CloseGossipMenuFor(player);
+            return;
+        case ACTION_OPEN_RATES:
+            ShowMenu(player, item->GetGUID(), PAGE_RATES);
+            return;
+        };
 
         // Enforce per-option enable/disable via config (menu also hides them, but double-check here)
         if ((action == ACTION_MORPH || action == ACTION_DEMORPH) && !sConfigMgr->GetOption<bool>("Morph", true))
@@ -1346,6 +1515,10 @@ public:
             case ACTION_BUFF_ME_CASTER:
                 CloseGossipMenuFor(player);
                 BuffMe(player, true);
+                return;
+            case ACTION_BUFF_ME_TANK:
+                CloseGossipMenuFor(player);
+                BuffMeTank(player);
                 return;
             case ACTION_FREE_REPAIR:
                 CloseGossipMenuFor(player);
@@ -1610,6 +1783,81 @@ public:
     }
 };
 
+class premium_personal_rates : public PlayerScript
+{
+public:
+    premium_personal_rates() : PlayerScript("premium_personal_rates", { PLAYERHOOK_ON_GIVE_EXP, PLAYERHOOK_ON_UPDATE_GATHERING_SKILL, PLAYERHOOK_ON_UPDATE_CRAFTING_SKILL }) {}
+
+    void OnPlayerGiveXP(Player* player, uint32& amount, Unit* /*victim*/, uint8 /*xpSource*/) override
+    {
+        if (!player || !amount)
+            return;
+
+        uint32 permille = GetXpRatePermille(player);
+
+        if (permille == 0)
+        {
+            amount = 0;
+            return;
+        }
+
+        if (permille >= 1000)
+            return;
+
+        uint64 scaled = (uint64(amount) * permille) / 1000;
+        if (scaled == 0)
+            scaled = 1;
+
+        amount = uint32(scaled);
+    }
+
+    void OnPlayerUpdateGatheringSkill(Player* player, uint32 /*skill_id*/, uint32 /*current*/, uint32 /*gray*/, uint32 /*green*/, uint32 /*yellow*/, uint32& gain) override
+    {
+        if (!player || !gain)
+            return;
+
+        uint32 permille = GetProfSkillRatePermille(player);
+
+        if (permille == 0)
+        {
+            gain = 0;
+            return;
+        }
+
+        if (permille >= 1000)
+            return;
+
+        uint64 scaled = (uint64(gain) * permille) / 1000;
+        if (scaled == 0)
+            scaled = 1;
+
+        gain = uint32(scaled);
+    }
+
+    void OnPlayerUpdateCraftingSkill(Player* player, SkillLineAbilityEntry const* /*skill*/, uint32 /*current_level*/, uint32& gain) override
+    {
+        if (!player || !gain)
+            return;
+
+        uint32 permille = GetProfSkillRatePermille(player);
+
+        if (permille == 0)
+        {
+            gain = 0;
+            return;
+        }
+
+        if (permille >= 1000)
+            return;
+
+        uint64 scaled = (uint64(gain) * permille) / 1000;
+        if (scaled == 0)
+            scaled = 1;
+
+        gain = uint32(scaled);
+    }
+};
+
 class premium_ap_tracker : public PlayerScript
 {
 public:
@@ -1665,4 +1913,5 @@ void AddPremiumAccount()
 {
     new premium_account();
     new premium_ap_tracker();
+    new premium_personal_rates();
 }
